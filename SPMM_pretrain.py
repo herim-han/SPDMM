@@ -11,7 +11,7 @@ def main(args, config):
     # data
     print("Creating dataset")
     #dataset = SMILESDataset_pretrain(args.data_path, data_length=[0, 50000000])
-    print('111111')
+    print('111111 start dataset')
     st = time.time() 
     dataset = SMILESDataset_pretrain(args.data_path)
     et = time.time()

@@ -17,13 +17,10 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 class SMILESDataset_pretrain(Dataset):
     def __init__(self, data_path, data_length=None, shuffle=False):
         self.smiles = [l.strip() for l in open(data_path).readlines()]
-        with open('./normalize.pkl', 'rb') as w:
-            norm = pickle.load(w)
-        self.property_mean, self.property_std = norm
 
         with Pool(24) as p:
-            results = p.map(self.preprocess, self.smiles)
-        self.data = [r for r in results if r is not None]
+            results = p.map(data_preprocess, self.smiles)
+        self.data = [r for r in results if None not in r]
 
         if shuffle:
             random.shuffle(self.data)
@@ -48,26 +45,22 @@ class SMILESDataset_pretrain(Dataset):
 #        except Exception:
 #            return None
 
-    def preprocess(self, smiles):
-        try:
-            smiles = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), isomericSmiles=False, canonical=True)
-            properties = (calculate_property(smiles) - self.property_mean) / self.property_std
-            atom_pair, dist = get_dist(smiles)
-            if any(x is None for x in (smiles, properties, atom_pair, dist)):
-                return None
-            return (properties, '[CLS]' + smiles, atom_pair, dist)
-        except Exception as e:
-#            print(f"Failed processing {smiles}: {e}")
+def data_preprocess(smiles):
+    property_mean, property_std = pickle.load(open('./normalize.pkl', 'rb') )
+    try:
+        smiles = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), isomericSmiles=False, canonical=True)
+        properties = (calculate_property(smiles) - property_mean) / property_std
+        atom_pair, dist = get_dist(smiles)
+        if any(x is None for x in (smiles, properties, atom_pair, dist)):
             return None
+        return (properties, '[CLS]' + smiles, atom_pair, dist)
+    except Exception as e:
+        print(f"Failed processing {smiles}: {e}")
+        return None
             
 def collate_fn(batch):
-    batch = [item for item in batch if item is not None]
-    if not batch:
-        return None
     properties, smiles, atom_pair, dist = zip(*batch)
     properties = torch.stack(properties)
-#    atom_pair = pad_sequence(torch.tensor(atom_pair).long(), batch_first=True, padding_value=0)
-#    dist = pad_sequence(torch.tensor(dist).float(), batch_first=True, padding_value=0)
     atom_pair = pad_sequence(atom_pair, batch_first=True, padding_value=0)
     dist = pad_sequence(dist, batch_first=True, padding_value=0)
     return properties, smiles, atom_pair, dist
