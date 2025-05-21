@@ -38,15 +38,16 @@ class SMILESDataset_pretrain(Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
-        return self.data[index]
-#        try:
-#            smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]), isomericSmiles=False, canonical=True)
-#            properties = (calculate_property(smiles) - self.property_mean) / self.property_std
-#            atom_pair, dist = get_dist(smiles)
-##            print('atom pair/dist', atom_pair.dtype, dist.dtype)
-#            return properties, '[CLS]' + smiles, atom_pair, dist
-#        except Exception:
-#            return None
+#        return self.data[index]
+        try:
+            smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]), isomericSmiles=False, canonical=True)
+            properties = (calculate_property(smiles) - self.property_mean) / self.property_std
+            atom_pair, dist = get_dist(smiles)
+#            print('atom pair/dist', atom_pair.dtype, dist.dtype)
+            return properties, '[CLS]' + smiles, atom_pair, dist
+        except Exception:
+            return None
+
     def preprocess(self, smiles):
         try:
             smiles = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), isomericSmiles=False, canonical=True)
@@ -67,7 +68,6 @@ class SMILESDataset_pretrain(Dataset):
             
 def collate_fn(batch):
     batch = [item for item in batch if item is not None]
-    print('batch for collat_fn', len(batch))
     if not batch:
         return None
     properties, smiles, atom_pair, dist = zip(*batch)
