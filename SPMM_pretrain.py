@@ -5,18 +5,22 @@ import torch.distributed
 import argparse
 from pathlib import Path
 from transformers import BertTokenizer, WordpieceTokenizer
-
+import time
 def main(args, config):
     ngpu=1
     # data
     print("Creating dataset")
     #dataset = SMILESDataset_pretrain(args.data_path, data_length=[0, 50000000])
-    
+    print('111111')
+    st = time.time() 
     dataset = SMILESDataset_pretrain(args.data_path)
+    et = time.time()
+    print('time for dataset', et-st)
     print('#data:', len(dataset), torch.cuda.is_available())
     if args.debugging:
 #        print('debugging!!!!!', config['batch_size'])
-        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+        #data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=0, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
     else:
 #        print('no debugging!!!!!', config['batch_size'])
         data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True)

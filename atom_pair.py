@@ -54,6 +54,7 @@ def get_dist( smi ):
         vocab_list.append(vocab_idx)
         dist_list.append(dist)
     return torch.tensor(vocab_list).long(), torch.tensor(dist_list).float()
+#    return vocab_list, dist_list
 
 if __name__ == '__main__':
     list_smi = [line.strip() for line in open('./data/1_Pretrain/1k_pretrain.txt')]

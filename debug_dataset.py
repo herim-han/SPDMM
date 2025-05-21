@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from multiprocessing import Pool
 RDLogger.DisableLog('rdApp.*')
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 class SMILESDataset_pretrain(Dataset):
     def __init__(self, data_path, data_length=None, shuffle=False):
@@ -27,7 +28,6 @@ class SMILESDataset_pretrain(Dataset):
         if shuffle:
             random.shuffle(self.data)
 #        self.smiles, self.prop, self.atom_pair,self.dist = [],[],[],[]
-#        with Pool(24) as p:
 #        for i in range(len(data)):
 #            try:
 #                smiles = Chem.MolToSmiles(Chem.MolFromSmiles(data[i]), isomericSMiles=False, canonical=True)
@@ -38,27 +38,21 @@ class SMILESDataset_pretrain(Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
-#        return self.data[index]
-        try:
-            smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]), isomericSmiles=False, canonical=True)
-            properties = (calculate_property(smiles) - self.property_mean) / self.property_std
-            atom_pair, dist = get_dist(smiles)
-#            print('atom pair/dist', atom_pair.dtype, dist.dtype)
-            return properties, '[CLS]' + smiles, atom_pair, dist
-        except Exception:
-            return None
+        return self.data[index]
+#        try:
+#            smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]), isomericSmiles=False, canonical=True)
+#            properties = (calculate_property(smiles) - self.property_mean) / self.property_std
+#            atom_pair, dist = get_dist(smiles)
+##            print('atom pair/dist', atom_pair.dtype, dist.dtype)
+#            return properties, '[CLS]' + smiles, atom_pair, dist
+#        except Exception:
+#            return None
 
     def preprocess(self, smiles):
         try:
             smiles = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), isomericSmiles=False, canonical=True)
-#            print('1111', smiles)
             properties = (calculate_property(smiles) - self.property_mean) / self.property_std
-#            print('2222', properties)
             atom_pair, dist = get_dist(smiles)
-            idx=0
-            if atom_pair is not None and dist is not None:
-                print(idx)
-                idx+=1
             if any(x is None for x in (smiles, properties, atom_pair, dist)):
                 return None
             return (properties, '[CLS]' + smiles, atom_pair, dist)
@@ -72,6 +66,8 @@ def collate_fn(batch):
         return None
     properties, smiles, atom_pair, dist = zip(*batch)
     properties = torch.stack(properties)
+#    atom_pair = pad_sequence(torch.tensor(atom_pair).long(), batch_first=True, padding_value=0)
+#    dist = pad_sequence(torch.tensor(dist).float(), batch_first=True, padding_value=0)
     atom_pair = pad_sequence(atom_pair, batch_first=True, padding_value=0)
     dist = pad_sequence(dist, batch_first=True, padding_value=0)
     return properties, smiles, atom_pair, dist
