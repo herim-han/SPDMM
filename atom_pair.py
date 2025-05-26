@@ -46,19 +46,6 @@ def get_dist( smi ):
     return torch.tensor(vocab_list).long(), torch.tensor(dist_list).float()
 #    return vocab_list
 
-def data_preprocess(smiles):
-    property_mean, property_std = pickle.load(open('./normalize.pkl', 'rb') )
-    try:
-        smiles = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), isomericSmiles=False, canonical=True)
-        properties = (calculate_property(smiles) - property_mean) / property_std
-        atom_pair, dist = get_dist(smiles)
-#        if any(x is None for x in (smiles, properties, atom_pair, dist)):
-#            return None
-        return (properties, '[CLS]' + smiles, atom_pair, dist)
-    except Exception as e:
-#        print(f"Failed processing {smiles}: {e}")
-        return None
-
 def safe_get_dist(args):
     property_mean, property_std = pickle.load(open('./normalize.pkl', 'rb') )
     idx, smi = args

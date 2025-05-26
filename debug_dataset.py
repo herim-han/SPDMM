@@ -11,16 +11,18 @@ from atom_pair import get_dist
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from multiprocessing import Pool
+from tqdm import tqdm
 RDLogger.DisableLog('rdApp.*')
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 class SMILESDataset_pretrain(Dataset):
     def __init__(self, data_path, data_length=None, shuffle=False):
-        self.smiles = [l.strip() for l in open(data_path).readlines()]
+        self.smiles = [l.strip() for l in open(data_path).readlines()][:500]
 
         with Pool(24) as p:
-            results = p.map(data_preprocess, self.smiles)
-        self.data = [r for r in results if None not in r]
+            results = list(tqdm(p.imap(data_preprocess, enumerate(self.smiles) ), total=len(self.smiles)) )
+#        self.data = [item for item in results if None not in item]
+        self.data = [item for item in results if all(x is not None for x in item)]
 
         if shuffle:
             random.shuffle(self.data)
@@ -45,17 +47,17 @@ class SMILESDataset_pretrain(Dataset):
 #        except Exception:
 #            return None
 
-def data_preprocess(smiles):
+def data_preprocess(args):
+    idx, smiles = args
     property_mean, property_std = pickle.load(open('./normalize.pkl', 'rb') )
     try:
         smiles = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), isomericSmiles=False, canonical=True)
         properties = (calculate_property(smiles) - property_mean) / property_std
-        atom_pair, dist = get_dist(smiles)
-        if any(x is None for x in (smiles, properties, atom_pair, dist)):
-            return None
-        return (properties, '[CLS]' + smiles, atom_pair, dist)
+#        dist = get_dist(smiles)
+        atom_set, dist = get_dist(smiles) or (None, None)
+        return properties, '[CLS]' + smiles, atom_set, dist
     except Exception as e:
-        print(f"Failed processing {smiles}: {e}")
+        print(f"Failed processing {idx} {smiles}: {e}")
         return None
             
 def collate_fn(batch):

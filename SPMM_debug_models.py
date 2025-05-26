@@ -34,7 +34,6 @@ def extract_feature(model, linear_proj, queue, inputs, is_momentum=False): #defa
         embeds = model(**inputs, return_dict=True).last_hidden_state
         feat = F.normalize(linear_proj(embeds[:, 0, :]), dim=-1) #prop_feat
         feat_all = torch.cat([feat.t(), queue.clone().detach()], dim=1) #feat_all
-#        print('extract_feature.forward', self.property_encoder is model, self.property_proj is linear_proj)
         return embeds, feat, feat_all
 
     if is_momentum:
@@ -43,21 +42,12 @@ def extract_feature(model, linear_proj, queue, inputs, is_momentum=False): #defa
     else:
         return featurize()
 
-#def extract_feature(model, linear_proj, queue, inputs, is_momentum=False): #default=student
-#    context = torch.no_grad() if is_momentum else torch.enable_grad()
-#    with context:
-#        embeds = model(**inputs, return_dict=True).last_hidden_state
-#        feat = F.normalize(linear_proj(embeds[:, 0, :]), dim=-1) #prop_feat
-#        feat_all = torch.cat([feat.t(), queue.clone().detach()], dim=1) #feat_all
-#        return embeds, feat, feat_all
-
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super(AttrDict, self).__init__(*args, **kwargs)
         self.__dict__ = self
 
 class SPMM(pl.LightningModule):
-    #def __init__(self, tokenizer=None, config=None, loader_len=0, no_train=False):
     def __init__(self, tokenizer=None, config=None, loader_len=0, no_train=False,debugging=False):
         super().__init__()
         self.debugging=debugging
@@ -71,24 +61,23 @@ class SPMM(pl.LightningModule):
 
         self.bert_config  =  BertConfig.from_json_file(config['bert_config_text'])
         self.bert_config2  =  BertConfig.from_json_file(config['bert_config_property'])
-        #self.bert_config2 =  copy.deepcopy(self.bert_config) # for prop, dist from config_bert_property.json
-        #norm_eps = self.bert_config2.layer_norm_eps
-
+         
+        # create student models (training target)
         self.init_modal("property", self.bert_config2, hidden_width, embed_dim)
-        self.property_encoder = self.property_encoder.bert
-        self.property_embed = nn.Linear(1, hidden_width)
-
         self.init_modal("text", self.bert_config, hidden_width, embed_dim)
         self.init_modal("dist", self.bert_config2, hidden_width, embed_dim)
+        self.property_encoder = self.property_encoder.bert
+        self.property_embed = nn.Linear(1, hidden_width)
         self.dist_encoder = self.dist_encoder.bert
         self.dist_embed_layer = Embed3DStruct(hidden_width//2, hidden_width//2)
+
         self.itm_head = nn.Linear(hidden_width * 2, 2)
 
         # create momentum models (knowledge distillation providing pseudo-label)
         self.init_modal("property", self.bert_config2, hidden_width, embed_dim,is_momentum=True)
-        self.property_encoder_m = self.property_encoder_m.bert
         self.init_modal("text", self.bert_config, hidden_width, embed_dim, is_momentum=True)
         self.init_modal("dist", self.bert_config2, hidden_width, embed_dim, is_momentum=True)
+        self.property_encoder_m = self.property_encoder_m.bert
         self.dist_encoder_m = self.dist_encoder_m.bert
 
         #pair for student model, teacher model
@@ -109,69 +98,73 @@ class SPMM(pl.LightningModule):
             self.loader_len = loader_len
             self.momentum = config['momentum']
             self.queue_size = config['queue_size']
-
-            self.register_buffer("property2one_queue", torch.randn(embed_dim, self.queue_size))
-            self.register_buffer("property2two_queue", torch.randn(embed_dim, self.queue_size))
-            self.register_buffer("text2one_queue", torch.randn(embed_dim, self.queue_size))
-            self.register_buffer("text2two_queue", torch.randn(embed_dim, self.queue_size))
-            self.register_buffer("dist2one_queue", torch.randn(embed_dim, self.queue_size))
-            self.register_buffer("dist2two_queue", torch.randn(embed_dim, self.queue_size))
-            self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-
-            self.property2one_queue = nn.functional.normalize(self.property2one_queue, dim=0)
-            self.property2two_queue = nn.functional.normalize(self.property2two_queue, dim=0)
-            self.text2one_queue = nn.functional.normalize(self.text2one_queue, dim=0)
-            self.text2two_queue = nn.functional.normalize(self.text2two_queue, dim=0)
-            self.dist2one_queue = nn.functional.normalize(self.dist2one_queue, dim=0)
-            self.dist2two_queue = nn.functional.normalize(self.dist2two_queue, dim=0)
+            for prefix in ['property', 'text', 'dist']:
+                self._init_queue_buffer(prefix, embed_dim, self.queue_size)
 
     def forward(self, property_original, text_input_ids, text_attention_mask, atom_pair, dist, alpha=0):
         if self.debugging:
             print('\n \n \n turn on debugging mode')
             self.set_eval_mode()
         with torch.no_grad():
-            self.temp.clamp_(0.01, 0.5)
-        print(property_original.shape)
-#        print(f'!!!!!!! bert_config(text) \n {self.bert_config}')
-#        print(f'!!!!!!! bert_config2(prop) \n {self.bert_config2}')
+            self.temp.clamp_(0.01, 0.5) #all elements in range (min, max)
 
-        property_feature = self.property_embed(torch.tensor(property_original).unsqueeze(2)) # (B, 53, 768)
-        print(property_feature.shape) 
+        #(B,len)>(B,len,embed_dim)
+        property_feature = self.property_embed(torch.tensor(property_original).unsqueeze(2)) 
+        #learnable empty tensor (B,len, embed_dim)
+        unk_tokens = self.property_mask.expand(property_original.size(0), property_original.size(1), -1)
+        # random masking (1 for mask, 0 for keep) > (B,len)
+        mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5)
+        # match dimension: (B,len)>(B,len,embed_dim)
+        mpm_mask_expand = mpm_mask.unsqueeze(2).repeat(1, 1, unk_tokens.size(2))
+        # replace masked tokens to unk tokens [1]
+        property_masked = property_feature * (1 - mpm_mask_expand) + unk_tokens * mpm_mask_expand 
+        # add learnalble cls token > (B,len+1,embed_dim)
+        properties = torch.cat([self.property_cls.expand(property_original.size(0), -1, -1), property_masked], dim=1)
 
-        unk_tokens = self.property_mask.expand(property_original.size(0), property_original.size(1), -1) # "learnable" empty torch (B, L_prop, width)
-        mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5)    # 1 for mask, 0 for keep, 0.5=masking ratio (B, L)
-        mpm_mask_expand = mpm_mask.unsqueeze(2).repeat(1, 1, unk_tokens.size(2)) # matching dimension: (B, L) > (B, L, 1) > (B, L, width)
-        property_masked = property_feature * (1 - mpm_mask_expand) + unk_tokens * mpm_mask_expand # replaced masked tokens
-
-        properties = torch.cat([self.property_cls.expand(property_original.size(0), -1, -1), property_masked], dim=1) # add "learnable" cls (B, L+1, width)
-#        ex_prop_embeds = self.property_encoder(inputs_embeds=properties, return_dict=True).last_hidden_state #final hidden layer for prop feature
-#        ex_prop_feat = F.normalize(self.property_proj(ex_prop_embeds[:, 0, :]), dim=-1) # normalize cls token embedding feature
-
-        prop_embeds, prop_feat, _ = extract_feature( 
+        prop2one_embeds, prop2one_feat, _ = extract_feature( 
                                                      self.property_encoder,
                                                      self.property2one_proj,
                                                      self.property2one_queue,
                                                      {"inputs_embeds": properties},
                                                      is_momentum=False, 
                                                    ) #(B, L_prop+1, embed), (B, dim=256)
-#        print(torch.equal(ex_prop_embeds, prop_embeds), torch.equal(ex_prop_feat, prop_feat))
-#        exit(-1)
+        prop2one_atts = torch.ones(prop2one_embeds.size()[:-1], dtype=torch.long).to(properties.device) # (B, L+1)
 
-        prop_atts = torch.ones(prop_embeds.size()[:-1], dtype=torch.long).to(properties.device) # (B, L+1)
-#        ex_text_embeds = self.text_encoder.bert(text_input_ids, attention_mask=text_attention_mask, return_dict=True, mode='text').last_hidden_state #attention_mask = padding 0 otherwise 1 (B, L_text) > (B, L_text, width=768)
-#        ex_text_feat = F.normalize(self.text_proj(ex_text_embeds[:, 0, :]), dim=-1) #(B, dim=256)
-        text_embeds, text_feat, _ = extract_feature(
-                                                     self.text_encoder.bert,
-                                                     self.text2two_proj,
-                                                     self.text2two_queue,
-                                                     {"input_ids": text_input_ids,
-                                                      "attention_mask": text_attention_mask,
-                                                      "mode":'text'},
+        prop2two_embeds, prop2two_feat, _ = extract_feature( 
+                                                     self.property_encoder,
+                                                     self.property2two_proj,
+                                                     self.property2two_queue,
+                                                     {"inputs_embeds": properties},
                                                      is_momentum=False, 
-                                                   )
-#        print(torch.equal(ex_text_embeds, text_embeds), torch.equal(ex_text_feat, text_feat))
-#        exit(-1)
-        
+                                                   ) #(B, L_prop+1, embed), (B, dim=256)
+        prop2two_atts = torch.ones(prop2two_embeds.size()[:-1], dtype=torch.long).to(properties.device) # (B, L+1)
+
+        #(B,len)>(B,len,embed_dim)
+        dist_feature = self.dist_embed_layer(atom_pair, dist)
+        unk_tokens   = self.dist_mask.expand(dist_feature.size(0), dist_feature.size(1), -1)#(B,len+1,embed_dim)
+        mpm_mask     = torch.bernoulli(torch.ones_like(dist_feature) * 0.5)
+        dist_mask    = dist_feature * (1-mpm_mask) + unk_tokens * mpm_mask
+        distances    = torch.cat([self.dist_cls.expand(dist_feature.size(0), -1,-1), dist_mask], dim=1)#(B,len+1,embed_dim)
+
+        dist2one_embeds, dist2one_feat, _ = extract_feature(
+                                                            self.dist_encoder,
+                                                            self.dist2one_proj,
+                                                            self.dist2one_queue,
+                                                            {"inputs_embeds": distances},
+                                                            is_momentum=False
+                                                           )
+        dist2one_atts = torch.ones(dist2one_embeds.size()[:-1], dtype=torch.long).to(distances.device) # (B, L+1)
+
+        text2one_embeds, text2one_feat, _ = extract_feature(
+                                                             self.text_encoder.bert,
+                                                             self.text2one_proj,
+                                                             self.text2one_queue,
+                                                             {"input_ids": text_input_ids,
+                                                              "attention_mask": text_attention_mask,
+                                                              "mode":'text'},
+                                                             is_momentum=False, 
+                                                           )
+
         # get momentum features generating soft target (probability)
         with torch.no_grad():
             self._momentum_update()
@@ -183,52 +176,40 @@ class SPMM(pl.LightningModule):
                                                                          {"inputs_embeds": properties},
                                                                          is_momentum=True,
                                                                         )
-            print('2222222', prop_embeds_m.shape, prop_feat_m.shape, prop_feat_all.shape)
+
+            dist_embeds_m, dist_feat_m, dist_feat_all = extract_feature(
+                                                                         self.dist_encoder_m,
+                                                                         self.dist2one_proj_m,
+                                                                         self.dist2one_queue,
+                                                                         {"inputs_embeds": distances},
+                                                                         is_momentum=True,
+                                                                        )
 
             text_embeds_m, text_feat_m, text_feat_all = extract_feature(
                                                                          self.text_encoder_m.bert,
-                                                                         self.text2two_proj_m,
-                                                                         self.text2two_queue,
+                                                                         self.text2one_proj_m,
+                                                                         self.text2one_queue,
                                                                          {"input_ids": text_input_ids,
                                                                           "attention_mask": text_attention_mask,
                                                                           'mode':'text'},
                                                                          is_momentum=True, 
                                                                        )
-            print('2222222', text_embeds_m.shape, text_feat_m.shape, text_feat_all.shape)
-##############            
-#            sim_i2t_m = prop_feat_m @ text_feat_all / self.temp
-#            sim_t2i_m = text_feat_m @ prop_feat_all / self.temp
-#            sim_i2i_m = prop_feat_m @ prop_feat_all / self.temp
-#            sim_t2t_m = text_feat_m @ text_feat_all / self.temp
-#            
-#            # hard label (diagonal 1 for positive pair)
-#            sim_targets = torch.zeros(sim_i2t_m.size()).to(properties.device)
-#            sim_targets.fill_diagonal_(1)
-#
-#            # total output from teacher model (soft label + hard label)
-#            sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets
-#            sim_t2i_targets = alpha * F.softmax(sim_t2i_m, dim=1) + (1 - alpha) * sim_targets
-#            sim_i2i_targets = alpha * F.softmax(sim_i2i_m, dim=1) + (1 - alpha) * sim_targets
-#            sim_t2t_targets = alpha * F.softmax(sim_t2t_m, dim=1) + (1 - alpha) * sim_targets
-#        
-#        # similarity "distribution" of student model
-#        sim_i2t = prop_feat @ text_feat_all / self.temp
-#        sim_t2i = text_feat @ prop_feat_all / self.temp
-#        sim_i2i = prop_feat @ prop_feat_all / self.temp
-#        sim_t2t = text_feat @ text_feat_all / self.temp
-#
-#        ex_loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1) * sim_i2t_targets, dim=1).mean()
-#        ex_loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1) * sim_t2i_targets, dim=1).mean()
-#        ex_loss_i2i = -torch.sum(F.log_softmax(sim_i2i, dim=1) * sim_i2i_targets, dim=1).mean()
-#        ex_loss_t2t = -torch.sum(F.log_softmax(sim_t2t, dim=1) * sim_t2t_targets, dim=1).mean()
 
         #inter-modality(p -> t, t -> p)
-        sim_i2t, sim_t2i,loss_i2t,loss_t2i = self.contrastive_loss(prop_feat, text_feat, 
+        sim_p2t, sim_t2p,loss_p2t,loss_t2p = self.contrastive_loss(prop2one_feat, text2one_feat, 
                                                                     prop_feat_m, text_feat_m, 
                                                                     prop_feat_all, text_feat_all, 
                                                                     alpha, self.temp)
+        sim_d2t, sim_t2d,loss_d2t,loss_t2d = self.contrastive_loss(dist2one_feat, text2two_feat, 
+                                                                    dist_feat_m, text_feat_m, 
+                                                                    dist_feat_all, text_feat_all, 
+                                                                    alpha, self.temp)
+        sim_p2d, sim_d2p,loss_p2d,loss_d2p = self.contrastive_loss(dist2two_feat, prop2two_feat, 
+                                                                    dist_feat_m, text_feat_m, 
+                                                                    dist_feat_all, text_feat_all, 
+                                                                    alpha, self.temp)
         #intra-modality(p -> p, t -> t)
-        sim_i2i, sim_t2t,loss_i2i,loss_t2t = self.contrastive_loss(prop_feat, text_feat, 
+        sim_i2i, sim_t2t,loss_i2i,loss_t2t = self.contrastive_loss(prop2one_feat, text2one_feat, 
                                                                     prop_feat_m, text_feat_m, 
                                                                     text_feat_all, prop_feat_all, 
                                                                     alpha, self.temp)
@@ -243,23 +224,7 @@ class SPMM(pl.LightningModule):
         # forward the positve image(prop)-text pair
         # cross attention: Q=prop, K,V=text
 
-#        pos_pos_prop = self.text_encoder.bert(encoder_embeds=prop_embeds, #input (prop)
-#                                              attention_mask=prop_atts,
-#                                              encoder_hidden_states=text_embeds, #cross attention for text
-#                                              encoder_attention_mask=text_attention_mask,
-#                                              return_dict=True,
-#                                              mode='fusion',
-#                                              ).last_hidden_state[:, 0, :] #cls token (B, D)
-#        pos_pos_text = self.text_encoder.bert(encoder_embeds=text_embeds,
-#                                              attention_mask=text_attention_mask,
-#                                              encoder_hidden_states=prop_embeds,
-#                                              encoder_attention_mask=prop_atts,
-#                                              return_dict=True,
-#                                              mode='fusion',
-#                                              ).last_hidden_state[:, 0, :]
-#        ex_pos_pos = torch.cat([pos_pos_prop, pos_pos_text], dim=-1)
         pos_pos = self.cross_attention_pair(prop_embeds, prop_atts, text_embeds, text_attention_mask)
-#        print(torch.equal(ex_pos_pos, pos_pos))
 
         #hard negative mining: trained more using high similarity with negative sample
         with torch.no_grad():
@@ -550,6 +515,7 @@ class SPMM(pl.LightningModule):
         loss_k2q = -torch.sum(F.log_softmax(sim_k2q, dim=1) * sim_k2q_targets, dim=1).mean()
     
         return sim_q2k, sim_k2q, loss_q2k, loss_k2q
+
     def set_eval_mode(self):
         # for debugging
         seed = 42
@@ -605,6 +571,12 @@ class SPMM(pl.LightningModule):
             setattr(self, f"{name}2one_proj", pt_proj)
             setattr(self, f"{name}2two_proj", pd_proj)
 
+    def _init_queue_buffer(self, prefix:str, embed_dim:int, queue_size:int):
+        for suffix in ['2one_queue', '2two_queue']:
+            name = f"{prefix}{suffix}"
+            self.register_buffer(name, torch.randn(embed_dim, queue_size) )
+            setattr(self, name, nn.functional.normalize(getattr(self, name), dim=0))
+
 @torch.no_grad()
 def concat_all_gather(tensor):
     """
@@ -632,8 +604,8 @@ class DistEmbedLayer(torch.nn.Module):
         if 1!=dist.size()[-1]:             # (B, max_pair)
             dist = dist.unsqueeze(-1)      # (B, max_pair, 1) 2D to expand 3D
         #self.center (n_feat) -> center(1,1,n_feat)
-        center = self.center.reshape( tuple([ 1 for i in range(len(dist.size())-1 )]+[-1]) ) #[1,1] + [-1] = [1,1,-1] => reshape([1,1,-1])=(1,1,n_feat)
-        exponent = self.exponent.reshape( tuple([ 1 for i in range(len(dist.size())-1 )]+[-1]) ) #same as center dimension
+        center = self.center.reshape( tuple([ 1 for i in range(len(dist.size())-1 )]+[-1]) ) #[1,1] + [-1] = [1,1,-1]
+        exponent = self.exponent.reshape( tuple([ 1 for i in range(len(dist.size())-1 )]+[-1]) ) 
         dist_f = torch.exp( -torch.abs(exponent) * torch.pow( dist - center, 2) ) #(B, max_pair, n_feat)
         # (B, ) -> (B, n_feat) for 2D-broadcasting
 #        center  = self.center.reshape(1, -1) # (n_feat) > (1, n_feat)
@@ -646,21 +618,16 @@ class Embed3DStruct(torch.nn.Module):
         super().__init__()
         self.pair_embed_length = symbol_pair_embed_length + distance_embed_length
         self.dist_embed = DistEmbedLayer(distance_embed_length, 0.0, 6.0)
-        self.pair_symbol_embed = nn.Embedding( 16 , symbol_pair_embed_length )
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.pair_embed_length))
+        self.pair_symbol_embed = nn.Embedding( 60 , symbol_pair_embed_length ) #(vocab_size, embed_length)
+        #self.cls_token = nn.Parameter(torch.zeros(1, 1, self.pair_embed_length))
 
-#        self.encoder_layer = nn.TransformerEncoderLayer( d_model = self.pair_embed_length,
-#                                                         nhead = n_head,
-#                                                         dropout = dropout,
-#                                                         batch_first =True,
-#                                                       )
     def forward(self, pair_symbols, distances):
-#        pair_symbols = dist[:, :, 0].long()  #(B, N_maxpair)  Long (int)
-#        distances     = dist[:, :, -1]    #(B, N_maxpair)   float
+#        print(pair_symbols.shape, pair_symbols.device)
         pair_symbol_feat = self.pair_symbol_embed(pair_symbols)  # (B, N_maxpair, embed_length)
+#        print(pair_symbol_feat.shape, pair_symbol_feat.divice)
         dist_feat = self.dist_embed(distances)
         embed_feat = torch.cat([ pair_symbol_feat, dist_feat], -1)
-        cls_embed_feat = torch.cat([self.cls_token.expand(embed_feat.size(0), -1, -1), embed_feat], dim=1)
+#        cls_embed_feat = torch.cat([self.cls_token.expand(embed_feat.size(0), -1, -1), embed_feat], dim=1)
 
         #return self.encoder_layer( feat ).permute(1,0,2) #(N_maxpair, B, embed_legnth)
-        return cls_embed_feat
+        return embed_feat

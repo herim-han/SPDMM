@@ -7,6 +7,7 @@ from pathlib import Path
 from transformers import BertTokenizer, WordpieceTokenizer
 import time
 def main(args, config):
+    CUDA_LAUNCH_BLOCKING=1
     ngpu=1
     # data
     print("Creating dataset")
@@ -19,8 +20,8 @@ def main(args, config):
     print('#data:', len(dataset), torch.cuda.is_available())
     if args.debugging:
 #        print('debugging!!!!!', config['batch_size'])
-        #data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
-        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=0, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+#        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=0, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
     else:
 #        print('no debugging!!!!!', config['batch_size'])
         data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True)
