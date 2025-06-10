@@ -33,7 +33,8 @@ def extract_feature(model, linear_proj, queue, inputs, is_momentum=False): #defa
     def featurize():
         embeds = model(**inputs, return_dict=True).last_hidden_state
         feat = F.normalize(linear_proj(embeds[:, 0, :]), dim=-1) #prop_feat
-        feat_all = torch.cat([feat.t(), queue.clone().detach()], dim=1) #feat_all
+        queue_on_device = queue.clone().detach().to(feat.device)
+        feat_all = torch.cat([feat.t(), queue_on_device], dim=1) #feat_all
         return embeds, feat, feat_all
 
     if is_momentum:
@@ -63,27 +64,27 @@ class SPMM(pl.LightningModule):
         self.bert_config2  =  BertConfig.from_json_file(config['bert_config_property'])
          
         # create student models (training target)
-        self.init_modal("property", self.bert_config2, hidden_width, embed_dim)
+        self.init_modal("prop", self.bert_config2, hidden_width, embed_dim)
         self.init_modal("text", self.bert_config, hidden_width, embed_dim)
         self.init_modal("dist", self.bert_config2, hidden_width, embed_dim)
-        self.property_encoder = self.property_encoder.bert
-        self.property_embed = nn.Linear(1, hidden_width)
+        self.prop_encoder = self.prop_encoder.bert
+        self.prop_embed = nn.Linear(1, hidden_width)
         self.dist_encoder = self.dist_encoder.bert
         self.dist_embed_layer = Embed3DStruct(hidden_width//2, hidden_width//2)
 
         self.itm_head = nn.Linear(hidden_width * 2, 2)
 
         # create momentum models (knowledge distillation providing pseudo-label)
-        self.init_modal("property", self.bert_config2, hidden_width, embed_dim,is_momentum=True)
+        self.init_modal("prop", self.bert_config2, hidden_width, embed_dim, is_momentum=True)
         self.init_modal("text", self.bert_config, hidden_width, embed_dim, is_momentum=True)
         self.init_modal("dist", self.bert_config2, hidden_width, embed_dim, is_momentum=True)
-        self.property_encoder_m = self.property_encoder_m.bert
+        self.prop_encoder_m = self.prop_encoder_m.bert
         self.dist_encoder_m = self.dist_encoder_m.bert
 
         #pair for student model, teacher model
-        self.model_pairs = [[self.property_encoder, self.property_encoder_m],
-                            #[self.property_proj, self.property_proj_m],
-                            [self.property2one_proj, self.property2one_proj_m],
+        self.model_pairs = [[self.prop_encoder, self.prop_encoder_m],
+                            #[self.prop_proj, self.prop_proj_m],
+                            [self.prop2one_proj, self.prop2one_proj_m],
                             [self.text_encoder, self.text_encoder_m],
                             [self.text2two_proj, self.text2two_proj_m],
                             ]
@@ -98,10 +99,47 @@ class SPMM(pl.LightningModule):
             self.loader_len = loader_len
             self.momentum = config['momentum']
             self.queue_size = config['queue_size']
-            for prefix in ['property', 'text', 'dist']:
+            for prefix in ['prop', 'text', 'dist']:
                 self._init_queue_buffer(prefix, embed_dim, self.queue_size)
 
+        self.static_config = {
+        "prop_encoder": self.prop_encoder,
+        "text_encoder": self.text_encoder,
+        "dist_encoder": self.dist_encoder,
+        "prop2one_proj": self.prop2one_proj,
+        "prop2two_proj": self.prop2two_proj,
+        "text2one_proj": self.text2one_proj,
+        "text2two_proj": self.text2two_proj,
+        "dist2one_proj": self.dist2one_proj,
+        "dist2two_proj": self.dist2two_proj,
+        "prop2one_queue": self.prop2one_queue,
+        "prop2two_queue": self.prop2two_queue,
+        "text2one_queue": self.text2one_queue,
+        "text2two_queue": self.text2two_queue,
+        "dist2one_queue": self.dist2one_queue,
+        "dist2two_queue": self.dist2two_queue,
+        }
+        self.static_m_config = {
+        "prop_encoder_m": self.prop_encoder_m,
+        "text_encoder_m": self.text_encoder_m,
+        "dist_encoder_m": self.dist_encoder_m,
+        "prop2one_proj_m": self.prop2one_proj_m,
+        "prop2two_proj_m": self.prop2two_proj_m,
+        "text2one_proj_m": self.text2one_proj_m,
+        "text2two_proj_m": self.text2two_proj_m,
+        "dist2one_proj_m": self.dist2one_proj_m,
+        "dist2two_proj_m": self.dist2two_proj_m
+        }
+
     def forward(self, property_original, text_input_ids, text_attention_mask, atom_pair, dist, alpha=0):
+        '''
+        Update note:
+         - .bert 없으면 (text) prediction_score (logits), hidden 모두 리턴 / 있으면 (prop) hidden만 리턴
+         - prop은 predict_score 대신 pred = self.property_mtr_head(prop_output).squeeze() 
+           -> dist도 같은 구조 필요
+         - add_cross_attention이 어떤 기능을 하는지 (기존 코드에서는 text config에만 있고) prop_config에는 아예 빠져 있음 (False 아님)
+        '''
+
         if self.debugging:
             print('\n \n \n turn on debugging mode')
             self.set_eval_mode()
@@ -109,9 +147,10 @@ class SPMM(pl.LightningModule):
             self.temp.clamp_(0.01, 0.5) #all elements in range (min, max)
 
         #(B,len)>(B,len,embed_dim)
-        property_feature = self.property_embed(torch.tensor(property_original).unsqueeze(2)) 
+        #property_feature = self.prop_embed(torch.tensor(property_original).unsqueeze(2)) 
+        property_feature = self.prop_embed(property_original.clone().detach().unsqueeze(2))
         #learnable empty tensor (B,len, embed_dim)
-        unk_tokens = self.property_mask.expand(property_original.size(0), property_original.size(1), -1)
+        unk_tokens = self.prop_mask.expand(property_original.size(0), property_original.size(1), -1)
         # random masking (1 for mask, 0 for keep) > (B,len)
         mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5)
         # match dimension: (B,len)>(B,len,embed_dim)
@@ -119,25 +158,7 @@ class SPMM(pl.LightningModule):
         # replace masked tokens to unk tokens [1]
         property_masked = property_feature * (1 - mpm_mask_expand) + unk_tokens * mpm_mask_expand 
         # add learnalble cls token > (B,len+1,embed_dim)
-        properties = torch.cat([self.property_cls.expand(property_original.size(0), -1, -1), property_masked], dim=1)
-
-        prop2one_embeds, prop2one_feat, _ = extract_feature( 
-                                                     self.property_encoder,
-                                                     self.property2one_proj,
-                                                     self.property2one_queue,
-                                                     {"inputs_embeds": properties},
-                                                     is_momentum=False, 
-                                                   ) #(B, L_prop+1, embed), (B, dim=256)
-        prop2one_atts = torch.ones(prop2one_embeds.size()[:-1], dtype=torch.long).to(properties.device) # (B, L+1)
-
-        prop2two_embeds, prop2two_feat, _ = extract_feature( 
-                                                     self.property_encoder,
-                                                     self.property2two_proj,
-                                                     self.property2two_queue,
-                                                     {"inputs_embeds": properties},
-                                                     is_momentum=False, 
-                                                   ) #(B, L_prop+1, embed), (B, dim=256)
-        prop2two_atts = torch.ones(prop2two_embeds.size()[:-1], dtype=torch.long).to(properties.device) # (B, L+1)
+        properties = torch.cat([self.prop_cls.expand(property_original.size(0), -1, -1), property_masked], dim=1)
 
         #(B,len)>(B,len,embed_dim)
         dist_feature = self.dist_embed_layer(atom_pair, dist)
@@ -146,76 +167,105 @@ class SPMM(pl.LightningModule):
         dist_mask    = dist_feature * (1-mpm_mask) + unk_tokens * mpm_mask
         distances    = torch.cat([self.dist_cls.expand(dist_feature.size(0), -1,-1), dist_mask], dim=1)#(B,len+1,embed_dim)
 
-        dist2one_embeds, dist2one_feat, _ = extract_feature(
-                                                            self.dist_encoder,
-                                                            self.dist2one_proj,
-                                                            self.dist2one_queue,
-                                                            {"inputs_embeds": distances},
-                                                            is_momentum=False
-                                                           )
-        dist2one_atts = torch.ones(dist2one_embeds.size()[:-1], dtype=torch.long).to(distances.device) # (B, L+1)
+        dynamic_inputs = {
+        'prop': {"inputs_embeds": properties,
+                 },
+        'text': {"input_ids": text_input_ids,
+                 "attention_mask": text_attention_mask,
+                 "mode": 'text',
+                 },
+        'dist': {"inputs_embeds": distances,
+                },
+        'is_momentum':False
+        }
 
-        text2one_embeds, text2one_feat, _ = extract_feature(
-                                                             self.text_encoder.bert,
-                                                             self.text2one_proj,
-                                                             self.text2one_queue,
-                                                             {"input_ids": text_input_ids,
-                                                              "attention_mask": text_attention_mask,
-                                                              "mode":'text'},
-                                                             is_momentum=False, 
-                                                           )
+        model_config = self.build_config(**self.static_config, **dynamic_inputs)
+        dynamic_inputs['is_momentum']=True
+        model_m_config = self.build_config(**self.static_m_config, **dynamic_inputs)
+        results= {}
+        results_m = {}
+        for modality, sub_cfgs in model_config.items():      # modality: prop, text, dist
+            for suffix, cfg in sub_cfgs.items():             # suffix: 2one, 2two
+                key = f"{modality}{suffix}"                  # ex: "prop2one"
 
-        # get momentum features generating soft target (probability)
-        with torch.no_grad():
-            self._momentum_update()
+                #feature from student model
+                encoder_model = cfg["model"].bert if modality == 'text' else cfg["model"]
 
-            prop_embeds_m, prop_feat_m, prop_feat_all = extract_feature(
-                                                                         self.property_encoder_m,
-                                                                         self.property2one_proj_m,
-                                                                         self.property2one_queue,
-                                                                         {"inputs_embeds": properties},
-                                                                         is_momentum=True,
-                                                                        )
+                embeds, feat, _ = extract_feature(
+                    encoder_model, cfg["proj"], cfg["queue"], cfg["inputs"], cfg["is_momentum"]
+                )
+                atts = torch.ones(embeds.size()[:-1], dtype=torch.long).to(embeds.device)
+                results[key] = {
+                    "embeds": embeds,
+                    "feat": feat,
+                    "atts": atts
+                }
+         
+                #feature from teacher model
+                with torch.no_grad():
+                    self._momentum_update()
+                    m_cfg = model_m_config[modality][suffix]
+                    momentum_encoder = m_cfg["model"].bert if modality == 'text' else m_cfg["model"]
+            
+                    m_embeds, m_feat, feat_all = extract_feature(
+                        momentum_encoder, m_cfg["proj"], cfg["queue"], cfg["inputs"], is_momentum=True
+                    )
+                    results_m[key] = {
+                        "m_embeds": m_embeds,
+                        "m_feat": m_feat,
+                        "m_feat_all": feat_all
+                    }
+#        print('student model results: \n', results['prop2one'], results['prop2one'].keys())
+#        print('teacher model results: \n', results_m['prop2one'], results_m['prop2one'].keys())
+#        exit(-1)
 
-            dist_embeds_m, dist_feat_m, dist_feat_all = extract_feature(
-                                                                         self.dist_encoder_m,
-                                                                         self.dist2one_proj_m,
-                                                                         self.dist2one_queue,
-                                                                         {"inputs_embeds": distances},
-                                                                         is_momentum=True,
-                                                                        )
+        #inter-modality
+        #(P>T: prop2one , T>P: text2two)
+        sim_p2t,sim_t2p,loss_p2t,loss_t2p = self.contrastive_loss(
+                                         results['prop2one']['feat'], results['text2two']['feat'], 
+                                         results_m['prop2one']['m_feat'], results_m['text2two']['m_feat'],
+                                         results_m['prop2one']['m_feat_all'], results_m['text2two']['m_feat_all'],
+                                         alpha, self.temp
+                                         )
+        #(D>T: dist2two, T>D: text2one)
+        sim_d2t,sim_t2d,loss_d2t,loss_t2d = self.contrastive_loss(
+                                         results['dist2two']['feat'], results['text2one']['feat'], 
+                                         results_m['dist2two']['m_feat'], results_m['text2one']['m_feat'],
+                                         results_m['dist2two']['m_feat_all'], results_m['text2one']['m_feat_all'],
+                                         alpha, self.temp
+                                         )
+        #(P>D: prop2two, D>P: dist2one)
+        sim_p2d,sim_d2p,loss_p2d,loss_d2p = self.contrastive_loss(
+                                         results['prop2two']['feat'], results['dist2one']['feat'], 
+                                         results_m['prop2two']['m_feat'], results_m['dist2one']['m_feat'],
+                                         results_m['prop2two']['m_feat_all'], results_m['dist2one']['m_feat_all'],
+                                         alpha, self.temp
+                                         )
 
-            text_embeds_m, text_feat_m, text_feat_all = extract_feature(
-                                                                         self.text_encoder_m.bert,
-                                                                         self.text2one_proj_m,
-                                                                         self.text2one_queue,
-                                                                         {"input_ids": text_input_ids,
-                                                                          "attention_mask": text_attention_mask,
-                                                                          'mode':'text'},
-                                                                         is_momentum=True, 
-                                                                       )
+        #intra-modality(p -> p, t -> t, d -> d)
+        sim_pp1, sim_pp2,loss_pp1, loss_pp2 = self.contrastive_loss(
+                                         results['prop2one']['feat'], results['prop2two']['feat'], 
+                                         results_m['prop2one']['m_feat'], results_m['prop2two']['m_feat'],
+                                         results_m['prop2two']['m_feat_all'], results_m['prop2one']['m_feat_all'],
+                                         alpha, self.temp
+                                         )
+        sim_tt1, sim_tt2,loss_tt1, loss_tt2 = self.contrastive_loss(
+                                         results['text2one']['feat'], results['text2two']['feat'], 
+                                         results_m['text2one']['m_feat'], results_m['text2two']['m_feat'],
+                                         results_m['text2two']['m_feat_all'], results_m['text2one']['m_feat_all'],
+                                         alpha, self.temp
+                                         )
+        sim_dd1, sim_dd2,loss_dd1, loss_dd2 = self.contrastive_loss(
+                                         results['dist2one']['feat'], results['dist2two']['feat'], 
+                                         results_m['dist2one']['m_feat'], results_m['dist2two']['m_feat'],
+                                         results_m['dist2two']['m_feat_all'], results_m['dist2one']['m_feat_all'],
+                                         alpha, self.temp
+                                         )
 
-        #inter-modality(p -> t, t -> p)
-        sim_p2t, sim_t2p,loss_p2t,loss_t2p = self.contrastive_loss(prop2one_feat, text2one_feat, 
-                                                                    prop_feat_m, text_feat_m, 
-                                                                    prop_feat_all, text_feat_all, 
-                                                                    alpha, self.temp)
-        sim_d2t, sim_t2d,loss_d2t,loss_t2d = self.contrastive_loss(dist2one_feat, text2two_feat, 
-                                                                    dist_feat_m, text_feat_m, 
-                                                                    dist_feat_all, text_feat_all, 
-                                                                    alpha, self.temp)
-        sim_p2d, sim_d2p,loss_p2d,loss_d2p = self.contrastive_loss(dist2two_feat, prop2two_feat, 
-                                                                    dist_feat_m, text_feat_m, 
-                                                                    dist_feat_all, text_feat_all, 
-                                                                    alpha, self.temp)
-        #intra-modality(p -> p, t -> t)
-        sim_i2i, sim_t2t,loss_i2i,loss_t2t = self.contrastive_loss(prop2one_feat, text2one_feat, 
-                                                                    prop_feat_m, text_feat_m, 
-                                                                    text_feat_all, prop_feat_all, 
-                                                                    alpha, self.temp)
-#        print(torch.equal(ex_loss_i2t,loss_i2t), torch.equal(ex_loss_t2i, loss_t2i), torch.equal(ex_loss_i2i, loss_i2i), torch.equal(ex_loss_t2t, loss_t2t))
+        loss_intra = loss_p2t + loss_p2d + loss_t2p + loss_t2d + loss_d2p + loss_d2t
+        loss_inter = loss_pp1 + loss_pp2 + loss_tt1 + loss_tt2 + loss_dd1 + loss_dd2
+        loss_ita  = (loss_intra + loss_inter) / 2
 
-        loss_ita = (loss_i2t + loss_t2i + loss_i2i + loss_t2t) / 2
 
         if torch.isnan(sim_i2t).any() or torch.isnan(sim_t2i).any() or torch.isnan(loss_ita):
             return torch.tensor(0.), torch.tensor(0.), torch.tensor(0.), torch.tensor(0.)
@@ -223,7 +273,6 @@ class SPMM(pl.LightningModule):
         # ================ ITM: Image-Text Matching ================= #
         # forward the positve image(prop)-text pair
         # cross attention: Q=prop, K,V=text
-
         pos_pos = self.cross_attention_pair(prop_embeds, prop_atts, text_embeds, text_attention_mask)
 
         #hard negative mining: trained more using high similarity with negative sample
@@ -525,11 +574,11 @@ class SPMM(pl.LightningModule):
         torch.cuda.manual_seed(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        self.property_encoder.eval()
-        self.property_mtr_head.eval()
-        self.property2one_proj.eval()
-        self.property2two_proj.eval()
-        self.property_embed.eval()
+        self.prop_encoder.eval()
+        self.prop_mtr_head.eval()
+        self.prop2one_proj.eval()
+        self.prop2two_proj.eval()
+        self.prop_embed.eval()
         self.text_encoder.eval()
         self.text_mtr_head.eval()
         self.text2one_proj.eval()
@@ -540,9 +589,9 @@ class SPMM(pl.LightningModule):
         self.dist2two_proj.eval()
         self.dist_embed_layer.eval()
         self.itm_head.eval()
-        self.property_encoder_m.eval()
-        self.property2one_proj_m.eval()
-        self.property2two_proj_m.eval()
+        self.prop_encoder_m.eval()
+        self.prop2one_proj_m.eval()
+        self.prop2two_proj_m.eval()
         self.text_encoder_m.eval()
         self.text2one_proj_m.eval()
         self.text2two_proj_m.eval()
@@ -576,6 +625,98 @@ class SPMM(pl.LightningModule):
             name = f"{prefix}{suffix}"
             self.register_buffer(name, torch.randn(embed_dim, queue_size) )
             setattr(self, name, nn.functional.normalize(getattr(self, name), dim=0))
+
+    def build_config(self, **kwargs):
+        if kwargs['is_momentum']== False: #student model
+            return {
+                "prop": {
+                    "2one": {
+                        "model": kwargs["prop_encoder"],
+                        "proj": kwargs["prop2one_proj"],
+                        "queue": kwargs["prop2one_queue"],
+                        "inputs": {"inputs_embeds": kwargs["prop"]["inputs_embeds"]},
+                        "is_momentum": kwargs["is_momentum"]
+                    },
+                    "2two": {
+                        "model": kwargs["prop_encoder"],
+                        "proj": kwargs["prop2two_proj"],
+                        "queue": kwargs["prop2two_queue"],
+                        "inputs": {"inputs_embeds": kwargs["prop"]["inputs_embeds"]},
+                        "is_momentum": kwargs['is_momentum']
+                    },
+                },
+                "dist": {
+                    "2one": {
+                        "model": kwargs["dist_encoder"],
+                        "proj": kwargs["dist2one_proj"],
+                        "queue": kwargs["dist2one_queue"],
+                        "inputs": {"inputs_embeds": kwargs["dist"]["inputs_embeds"]},
+                        "is_momentum": kwargs['is_momentum']
+                    },
+                    "2two": {
+                        "model": kwargs["dist_encoder"],
+                        "proj": kwargs["dist2two_proj"],
+                        "queue": kwargs["dist2two_queue"],
+                        "inputs": {"inputs_embeds": kwargs["dist"]["inputs_embeds"]},
+                        "is_momentum": kwargs['is_momentum']
+                    },
+                },
+                "text": {
+                    "2one": {
+                        "model": kwargs["text_encoder"],
+                        "proj": kwargs["text2one_proj"],
+                        "queue": kwargs["text2one_queue"],
+                        "inputs": {"input_ids": kwargs['text']['input_ids'],
+                                   "attention_mask": kwargs['text']['attention_mask'],
+                                   "mode": kwargs['text']['mode']
+                                  },
+                        "is_momentum": kwargs['is_momentum']
+                    },
+                    "2two": {
+                        "model": kwargs["text_encoder"],
+                        "proj": kwargs["text2two_proj"],
+                        "queue": kwargs["text2two_queue"],
+                        "inputs": {"input_ids": kwargs["text"]["input_ids"],
+                                   "attention_mask": kwargs["text"]["attention_mask"],
+                                   "mode": kwargs["text"]["mode"]
+                                  },
+                        "is_momentum": kwargs['is_momentum']
+                    },
+                },
+            }
+        else:#is_momentum=True, teacher model
+            return {
+                "prop": {
+                    "2one": {
+                        "model": kwargs["prop_encoder_m"],
+                        "proj": kwargs["prop2one_proj_m"],
+                    },
+                    "2two": {
+                        "model": kwargs["prop_encoder_m"],
+                        "proj": kwargs["prop2two_proj_m"],
+                    },
+                },
+                "dist": {
+                    "2one": {
+                        "model": kwargs["dist_encoder_m"],
+                        "proj": kwargs["dist2one_proj_m"],
+                    },
+                    "2two": {
+                        "model": kwargs["dist_encoder_m"],
+                        "proj": kwargs["dist2two_proj_m"],
+                    },
+                },
+                "text": {
+                    "2one": {
+                        "model": kwargs["text_encoder_m"],
+                        "proj": kwargs["text2one_proj_m"],
+                    },
+                    "2two": {
+                        "model": kwargs["text_encoder_m"],
+                        "proj": kwargs["text2two_proj_m"],
+                    },
+                },
+            }
 
 @torch.no_grad()
 def concat_all_gather(tensor):

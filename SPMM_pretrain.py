@@ -6,6 +6,8 @@ import argparse
 from pathlib import Path
 from transformers import BertTokenizer, WordpieceTokenizer
 import time
+import pickle
+
 def main(args, config):
     CUDA_LAUNCH_BLOCKING=1
     ngpu=1
@@ -13,32 +15,34 @@ def main(args, config):
     print("Creating dataset")
     #dataset = SMILESDataset_pretrain(args.data_path, data_length=[0, 50000000])
     print('111111 start dataset')
-    st = time.time() 
-    dataset = SMILESDataset_pretrain(args.data_path)
+    st = time.time()
+    if (args.pkl is None):
+        dataset = SMILESDataset_pretrain(args.data_path)
+        with open('dataset.pkl', 'wb') as f:
+            pickle.dump(dataset, f)
+    else:
+        dataset = pickle.load(open(args.pkl, 'rb'))
+
     et = time.time()
     print('time for dataset', et-st)
     print('#data:', len(dataset), torch.cuda.is_available())
+
     if args.debugging:
-#        print('debugging!!!!!', config['batch_size'])
         data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
-#        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=0, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
     else:
-#        print('no debugging!!!!!', config['batch_size'])
         data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True)
+
     tokenizer = BertTokenizer(vocab_file=args.vocab_filename, do_lower_case=False, do_basic_tokenize=False, add_special_tokens=False)
     tokenizer.wordpiece_tokenizer = WordpieceTokenizer(vocab=tokenizer.vocab, unk_token=tokenizer.unk_token, max_input_chars_per_word=250)
-    # model
-#    print(len(data_loader)//torch.cuda.device_count())
+
     model = SPMM(config=config, tokenizer=tokenizer, loader_len=len(data_loader) // torch.cuda.device_count(), debugging=args.debugging)
+
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location='cpu')
         _ = model.load_state_dict(checkpoint['state_dict'], strict=False)
 
     # training
     checkpoint_callback = pl.callbacks.ModelCheckpoint(dirpath=args.output_dir, filename='checkpoint_{epoch}',
-                                                       #save_top_k=2, 
-                                                       #monitor='epoch',
-                                                       #every_n_epochs=1,
                                                        every_n_train_steps=10000,
                                                        )
     trainer = pl.Trainer(accelerator='gpu', devices=ngpu, precision='16-mixed', max_epochs=config['schedular']['epochs'],
@@ -51,6 +55,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', default='')
     # parser.add_argument('--data_path', default='./data/1_Pretrain/pretrain_20m.txt')
     parser.add_argument('--data_path', default='./data/chemformer_parsed2_shuffle.txt')
+    parser.add_argument('--pkl', default=None)
     parser.add_argument('--resume', default=False, type=bool)
     parser.add_argument('--output_dir', default='./Pretrain')
     parser.add_argument('--vocab_filename', default='./vocab_bpe_300.txt')
