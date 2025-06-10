@@ -202,19 +202,18 @@ class SPMM(pl.LightningModule):
                 }
          
                 #feature from teacher model
-                with torch.no_grad():
-                    self._momentum_update()
-                    m_cfg = model_m_config[modality][suffix]
-                    momentum_encoder = m_cfg["model"].bert if modality == 'text' else m_cfg["model"]
+                self._momentum_update()
+                m_cfg = model_m_config[modality][suffix]
+                momentum_encoder = m_cfg["model"].bert if modality == 'text' else m_cfg["model"]
             
-                    m_embeds, m_feat, feat_all = extract_feature(
-                        momentum_encoder, m_cfg["proj"], cfg["queue"], cfg["inputs"], is_momentum=True
-                    )
-                    results_m[key] = {
-                        "m_embeds": m_embeds,
-                        "m_feat": m_feat,
-                        "m_feat_all": feat_all
-                    }
+                m_embeds, m_feat, feat_all = extract_feature(
+                    momentum_encoder, m_cfg["proj"], cfg["queue"], cfg["inputs"], is_momentum=True
+                )
+                results_m[key] = {
+                    "m_embeds": m_embeds,
+                    "m_feat": m_feat,
+                    "m_feat_all": feat_all
+                }
 #        print('student model results: \n', results['prop2one'], results['prop2one'].keys())
 #        print('teacher model results: \n', results_m['prop2one'], results_m['prop2one'].keys())
 #        exit(-1)
@@ -265,7 +264,6 @@ class SPMM(pl.LightningModule):
         loss_intra = loss_p2t + loss_p2d + loss_t2p + loss_t2d + loss_d2p + loss_d2t
         loss_inter = loss_pp1 + loss_pp2 + loss_tt1 + loss_tt2 + loss_dd1 + loss_dd2
         loss_ita  = (loss_intra + loss_inter) / 2
-
 
         if torch.isnan(sim_i2t).any() or torch.isnan(sim_t2i).any() or torch.isnan(loss_ita):
             return torch.tensor(0.), torch.tensor(0.), torch.tensor(0.), torch.tensor(0.)
