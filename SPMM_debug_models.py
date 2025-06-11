@@ -132,14 +132,6 @@ class SPMM(pl.LightningModule):
         }
 
     def forward(self, property_original, text_input_ids, text_attention_mask, atom_pair, dist, alpha=0):
-        '''
-        Update note:
-         - .bert 없으면 (text) prediction_score (logits), hidden 모두 리턴 / 있으면 (prop) hidden만 리턴
-         - prop은 predict_score 대신 pred = self.property_mtr_head(prop_output).squeeze() 
-           -> dist도 같은 구조 필요
-         - add_cross_attention이 어떤 기능을 하는지 (기존 코드에서는 text config에만 있고) prop_config에는 아예 빠져 있음 (False 아님)
-        '''
-
         if self.debugging:
             print('\n \n \n turn on debugging mode')
             self.set_eval_mode()
@@ -168,14 +160,11 @@ class SPMM(pl.LightningModule):
         distances    = torch.cat([self.dist_cls.expand(dist_feature.size(0), -1,-1), dist_mask], dim=1)#(B,len+1,embed_dim)
 
         dynamic_inputs = {
-        'prop': {"inputs_embeds": properties,
-                 },
+        'prop': {"inputs_embeds": properties},
         'text': {"input_ids": text_input_ids,
                  "attention_mask": text_attention_mask,
-                 "mode": 'text',
-                 },
-        'dist': {"inputs_embeds": distances,
-                },
+                 "mode": 'text'},
+        'dist': {"inputs_embeds": distances},
         'is_momentum':False
         }
 
@@ -187,10 +176,10 @@ class SPMM(pl.LightningModule):
         for modality, sub_cfgs in model_config.items():      # modality: prop, text, dist
             for suffix, cfg in sub_cfgs.items():             # suffix: 2one, 2two
                 key = f"{modality}{suffix}"                  # ex: "prop2one"
-
+#                print(modality, cfg["model"])
+#                print(type(cfg["model"]) )
                 #feature from student model
                 encoder_model = cfg["model"].bert if modality == 'text' else cfg["model"]
-
                 embeds, feat, _ = extract_feature(
                     encoder_model, cfg["proj"], cfg["queue"], cfg["inputs"], cfg["is_momentum"]
                 )
@@ -214,63 +203,57 @@ class SPMM(pl.LightningModule):
                     "m_feat": m_feat,
                     "m_feat_all": feat_all
                 }
-#        print('student model results: \n', results['prop2one'], results['prop2one'].keys())
-#        print('teacher model results: \n', results_m['prop2one'], results_m['prop2one'].keys())
-#        exit(-1)
 
         #inter-modality
-        #(P>T: prop2one , T>P: text2two)
-        sim_p2t,sim_t2p,loss_p2t,loss_t2p = self.contrastive_loss(
-                                         results['prop2one']['feat'], results['text2two']['feat'], 
-                                         results_m['prop2one']['m_feat'], results_m['text2two']['m_feat'],
-                                         results_m['prop2one']['m_feat_all'], results_m['text2two']['m_feat_all'],
-                                         alpha, self.temp
-                                         )
-        #(D>T: dist2two, T>D: text2one)
-        sim_d2t,sim_t2d,loss_d2t,loss_t2d = self.contrastive_loss(
-                                         results['dist2two']['feat'], results['text2one']['feat'], 
-                                         results_m['dist2two']['m_feat'], results_m['text2one']['m_feat'],
-                                         results_m['dist2two']['m_feat_all'], results_m['text2one']['m_feat_all'],
-                                         alpha, self.temp
-                                         )
-        #(P>D: prop2two, D>P: dist2one)
-        sim_p2d,sim_d2p,loss_p2d,loss_d2p = self.contrastive_loss(
-                                         results['prop2two']['feat'], results['dist2one']['feat'], 
-                                         results_m['prop2two']['m_feat'], results_m['dist2one']['m_feat'],
-                                         results_m['prop2two']['m_feat_all'], results_m['dist2one']['m_feat_all'],
-                                         alpha, self.temp
-                                         )
+        inter_pairs = [
+            ('prop2one', 'text2two', 'p2t', 't2p'),
+            ('dist2two', 'text2one', 'd2t', 't2d'),
+            ('prop2two', 'dist2one', 'p2d', 'd2p'),
+        ]
+        sim_dict, loss_dict ={}, {} 
+        for (res1_key, res2_key, sim1_prefix, sim2_prefix) in inter_pairs:
+            sim1, sim2, loss1, loss2 = self.contrastive_loss(
+                results[res1_key]['feat'], results[res2_key]['feat'],
+                results_m[res1_key]['m_feat'], results_m[res2_key]['m_feat'],
+                results_m[res1_key]['m_feat_all'], results_m[res2_key]['m_feat_all'],
+                alpha, self.temp
+            )
 
-        #intra-modality(p -> p, t -> t, d -> d)
-        sim_pp1, sim_pp2,loss_pp1, loss_pp2 = self.contrastive_loss(
-                                         results['prop2one']['feat'], results['prop2two']['feat'], 
-                                         results_m['prop2one']['m_feat'], results_m['prop2two']['m_feat'],
-                                         results_m['prop2two']['m_feat_all'], results_m['prop2one']['m_feat_all'],
-                                         alpha, self.temp
-                                         )
-        sim_tt1, sim_tt2,loss_tt1, loss_tt2 = self.contrastive_loss(
-                                         results['text2one']['feat'], results['text2two']['feat'], 
-                                         results_m['text2one']['m_feat'], results_m['text2two']['m_feat'],
-                                         results_m['text2two']['m_feat_all'], results_m['text2one']['m_feat_all'],
-                                         alpha, self.temp
-                                         )
-        sim_dd1, sim_dd2,loss_dd1, loss_dd2 = self.contrastive_loss(
-                                         results['dist2one']['feat'], results['dist2two']['feat'], 
-                                         results_m['dist2one']['m_feat'], results_m['dist2two']['m_feat'],
-                                         results_m['dist2two']['m_feat_all'], results_m['dist2one']['m_feat_all'],
-                                         alpha, self.temp
-                                         )
+            if any(torch.isnan(x).any() for x in [sim1, sim2, loss1, loss2]):
+                sim1, sim2, loss1, loss2 = 0, 0, 0 , 0
+            sim_dict[f'{sim1_prefix}'] = sim1
+            sim_dict[f'{sim2_prefix}'] = sim2
+            loss_dict[f'{sim1_prefix}'] =loss1
+            loss_dict[f'{sim1_prefix}'] =loss2
 
-        loss_intra = loss_p2t + loss_p2d + loss_t2p + loss_t2d + loss_d2p + loss_d2t
-        loss_inter = loss_pp1 + loss_pp2 + loss_tt1 + loss_tt2 + loss_dd1 + loss_dd2
-        loss_ita  = (loss_intra + loss_inter) / 2
+        intra_pairs = [
+            ('prop2one', 'prop2two', 'pp1', 'pp2'),
+            ('text2one', 'text2two', 'tt1', 'tt2'),
+            ('dist2one', 'dist2two', 'dd1', 'dd2')
+        ]
+        for (res1_key, res2_key, sim1_prefix, sim2_prefix) in intra_pairs:
+            sim1, sim2, loss1, loss2 = self.contrastive_loss(
+            results[res1_key]['feat'], results[res2_key]['feat'],
+            results_m[res1_key]['m_feat'], results_m[res2_key]['m_feat'],
+            results_m[res2_key]['m_feat_all'], results_m[res2_key]['m_feat_all'],
+            alpha, self.temp)
 
-        if torch.isnan(sim_i2t).any() or torch.isnan(sim_t2i).any() or torch.isnan(loss_ita):
-            return torch.tensor(0.), torch.tensor(0.), torch.tensor(0.), torch.tensor(0.)
+            if any(torch.isnan(x).any() for x in [sim1, sim2, loss1, loss2]):
+                sim1, sim2, loss1, loss2 = 0, 0, 0 , 0
+            sim_dict[f'{sim1_prefix}'] = sim1
+            sim_dict[f'{sim2_prefix}'] = sim2
+            loss_dict[f'{sim1_prefix}'] =loss1
+            loss_dict[f'{sim1_prefix}'] =loss2
+
+        all_loss  = sum(loss_dict.values() )
+        loss_ita = all_loss * 0.5
+        print('1111111111111111111 \n contrastive loss')
 
         # ================ ITM: Image-Text Matching ================= #
         # forward the positve image(prop)-text pair
         # cross attention: Q=prop, K,V=text
+        print(results.keys(), results['prop2one'].keys())
+        exit(-1)
         pos_pos = self.cross_attention_pair(prop_embeds, prop_atts, text_embeds, text_attention_mask)
 
         #hard negative mining: trained more using high similarity with negative sample
@@ -312,34 +295,17 @@ class SPMM(pl.LightningModule):
         # encoder-only (bert, using full tokens, bidirectional context, extract features)
         pos_neg = self.cross_attention_pair(prop_embeds_all, prop_atts_all, text_embeds_all, text_atts_all)
 
-#        pos_neg_prop = self.text_encoder.bert(encoder_embeds=prop_embeds_all, # Q
-#                                              attention_mask=prop_atts_all,
-#                                              encoder_hidden_states=text_embeds_all, # K, V
-#                                              encoder_attention_mask=text_atts_all,
-#                                              return_dict=True,
-#                                              mode='fusion',
-#                                              ).last_hidden_state[:, 0, :]
-#        pos_neg_text = self.text_encoder.bert(encoder_embeds=text_embeds_all,
-#                                              attention_mask=text_atts_all,
-#                                              encoder_hidden_states=prop_embeds_all,
-#                                              encoder_attention_mask=prop_atts_all,
-#                                              return_dict=True,
-#                                              mode='fusion',
-#                                              ).last_hidden_state[:, 0, :]
-#        ex_pos_neg = torch.cat([pos_neg_prop, pos_neg_text], dim=-1)
-#        print(torch.equal(pos_neg, ex_pos_neg))
-
         # positive-positive pair (B, 2D), positive-negative pair (2*B, 2D)
         vl_embeddings = torch.cat([pos_pos, pos_neg], dim=0)
         # binary classification for pair (2*B, 2) itm_head=MLP head (nn.Linear)
         vl_output = self.itm_head(vl_embeddings)
         # True label for predicting pair
-        print(bs)
+        #print(bs)
         itm_labels = torch.cat([torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
                                dim=0).to(properties.device)
         loss_itm = F.cross_entropy(vl_output, itm_labels)
+
         # adding queue from momentum teacher feature in the Batch
-        #print('11111111', prop_feat_m.shape, text_feat_m.shape)
         self._dequeue_and_enqueue(prop_feat_m, text_feat_m)
 
         # ================= MLM: Masked Language Modeling + teacher distillation ================= #
@@ -497,7 +463,7 @@ class SPMM(pl.LightningModule):
 
 
     def cross_attention_pair(self, q_embeds, q_atts, k_embeds, k_atts):
-        # prop / text cross attention for pair matching
+        # all modality integrated text_encoder.bert > tri-modal cross attention
         q_pair = self.text_encoder.bert(
                                            encoder_embeds=q_embeds,
                                            attention_mask=q_atts,
