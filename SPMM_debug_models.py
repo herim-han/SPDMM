@@ -137,7 +137,6 @@ class SPMM(pl.LightningModule):
             self.set_eval_mode()
         with torch.no_grad():
             self.temp.clamp_(0.01, 0.5) #all elements in range (min, max)
-
         #(B,len)>(B,len,embed_dim)
         #property_feature = self.prop_embed(torch.tensor(property_original).unsqueeze(2)) 
         property_feature = self.prop_embed(property_original.clone().detach().unsqueeze(2))

@@ -22,7 +22,6 @@ def main(args, config):
             pickle.dump(dataset, f)
     else:
         dataset = pickle.load(open(args.pkl, 'rb'))
-
     et = time.time()
     print('time for dataset', et-st)
     print('#data:', len(dataset), torch.cuda.is_available())
