@@ -9,16 +9,15 @@ import random
 import numpy as np
 import copy
 import json
+import pickle
 
 def create_unimodal_models(config, hidden_width, embed_dim, norm_eps, is_momentum=False):
     encoder = BertForMaskedLM(config=config)
-    ptd_pt_proj = nn.Linear(hidden_width, embed_dim)
-    ptd_pd_proj = nn.Linear(hidden_width, embed_dim)
+    proj_layer = nn.Linear(hidden_width, embed_dim)
     if is_momentum:
         for p in encoder.parameters():      p.requires_grad = False
-        for p in ptd_pt_proj.parameters():  p.requires_grad = False
-        for p in ptd_pd_proj.parameters():  p.requires_grad = False
-        return encoder, ptd_pt_proj, ptd_pd_proj
+        for p in proj_layer.parameters():   p.requires_grad = False
+        return encoder, proj_layer
     else:
         mtr_head = nn.Sequential(nn.Linear(hidden_width, hidden_width),
                                                    nn.GELU(),
@@ -26,13 +25,14 @@ def create_unimodal_models(config, hidden_width, embed_dim, norm_eps, is_momentu
                                                    nn.Linear(hidden_width, 1))
         cls_token   = nn.Parameter(torch.zeros(1,1, hidden_width))
         mask_token  = nn.Parameter(torch.zeros(1,1, hidden_width))
-        #property_embed = nn.Linear(1, hidden_width)
-        return encoder, mtr_head, cls_token, mask_token, ptd_pt_proj, ptd_pd_proj
+        return encoder, mtr_head, cls_token, mask_token, proj_layer
 
 def extract_feature(model, linear_proj, queue, inputs, is_momentum=False): #default=student
     def featurize():
         embeds = model(**inputs, return_dict=True).last_hidden_state
         feat = F.normalize(linear_proj(embeds[:, 0, :]), dim=-1) #prop_feat
+#        print(feat.device, queue.device, feat.shape, queue.shape)
+#        exit(-1)
         queue_on_device = queue.clone().detach().to(feat.device)
         feat_all = torch.cat([feat.t(), queue_on_device], dim=1) #feat_all
         return embeds, feat, feat_all
@@ -60,13 +60,14 @@ class SPMM(pl.LightningModule):
         embed_dim = config['embed_dim']
         hidden_width = config['property_width']
 
-        self.bert_config  =  BertConfig.from_json_file(config['bert_config_text'])
+        self.bert_config   =  BertConfig.from_json_file(config['bert_config_text'])
         self.bert_config2  =  BertConfig.from_json_file(config['bert_config_property'])
          
         # create student models (training target)
         self.init_modal("prop", self.bert_config2, hidden_width, embed_dim)
         self.init_modal("text", self.bert_config, hidden_width, embed_dim)
         self.init_modal("dist", self.bert_config2, hidden_width, embed_dim)
+
         self.prop_encoder = self.prop_encoder.bert
         self.prop_embed = nn.Linear(1, hidden_width)
         self.dist_encoder = self.dist_encoder.bert
@@ -83,10 +84,11 @@ class SPMM(pl.LightningModule):
 
         #pair for student model, teacher model
         self.model_pairs = [[self.prop_encoder, self.prop_encoder_m],
-                            #[self.prop_proj, self.prop_proj_m],
-                            [self.prop2one_proj, self.prop2one_proj_m],
+                            [self.prop_proj, self.prop_proj_m],
                             [self.text_encoder, self.text_encoder_m],
-                            [self.text2two_proj, self.text2two_proj_m],
+                            [self.text_proj, self.text_proj_m],
+                            [self.dist_encoder, self.dist_encoder_m],
+                            [self.dist_proj, self.dist_proj_m],
                             ]
 
         self.copy_params()
@@ -106,29 +108,20 @@ class SPMM(pl.LightningModule):
         "prop_encoder": self.prop_encoder,
         "text_encoder": self.text_encoder,
         "dist_encoder": self.dist_encoder,
-        "prop2one_proj": self.prop2one_proj,
-        "prop2two_proj": self.prop2two_proj,
-        "text2one_proj": self.text2one_proj,
-        "text2two_proj": self.text2two_proj,
-        "dist2one_proj": self.dist2one_proj,
-        "dist2two_proj": self.dist2two_proj,
-        "prop2one_queue": self.prop2one_queue,
-        "prop2two_queue": self.prop2two_queue,
-        "text2one_queue": self.text2one_queue,
-        "text2two_queue": self.text2two_queue,
-        "dist2one_queue": self.dist2one_queue,
-        "dist2two_queue": self.dist2two_queue,
+        "prop_proj": self.prop_proj,
+        "text_proj": self.text_proj,
+        "dist_proj": self.dist_proj,
+        "prop_queue": self.prop_queue,
+        "text_queue": self.text_queue,
+        "dist_queue": self.dist_queue,
         }
         self.static_m_config = {
         "prop_encoder_m": self.prop_encoder_m,
         "text_encoder_m": self.text_encoder_m,
         "dist_encoder_m": self.dist_encoder_m,
-        "prop2one_proj_m": self.prop2one_proj_m,
-        "prop2two_proj_m": self.prop2two_proj_m,
-        "text2one_proj_m": self.text2one_proj_m,
-        "text2two_proj_m": self.text2two_proj_m,
-        "dist2one_proj_m": self.dist2one_proj_m,
-        "dist2two_proj_m": self.dist2two_proj_m
+        "prop_proj_m": self.prop_proj_m,
+        "text_proj_m": self.text_proj_m,
+        "dist_proj_m": self.dist_proj_m,
         }
 
     def forward(self, property_original, text_input_ids, text_attention_mask, atom_pair, dist, alpha=0):
@@ -146,7 +139,7 @@ class SPMM(pl.LightningModule):
         mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5)
         # match dimension: (B,len)>(B,len,embed_dim)
         mpm_mask_expand = mpm_mask.unsqueeze(2).repeat(1, 1, unk_tokens.size(2))
-        # replace masked tokens to unk tokens [1]
+        # replace masked tokens to filled 0 tensor (B, len, embed_dim)
         property_masked = property_feature * (1 - mpm_mask_expand) + unk_tokens * mpm_mask_expand 
         # add learnalble cls token > (B,len+1,embed_dim)
         properties = torch.cat([self.prop_cls.expand(property_original.size(0), -1, -1), property_masked], dim=1)
@@ -168,82 +161,68 @@ class SPMM(pl.LightningModule):
         }
 
         model_config = self.build_config(**self.static_config, **dynamic_inputs)
+        results= {}
+        for modal in model_config.keys():      # modal: prop, text, dist
+            e_model = model_config[modal]["model"].bert if modal == 'text' else model_config[modal]["model"]
+            embeds, feat, _ = extract_feature(
+                e_model, model_config[modal]["proj"], model_config[modal]["queue"], model_config[modal]["inputs"], model_config[modal]["is_momentum"]
+            )
+            atts = torch.ones(embeds.size()[:-1], dtype=torch.long).to(embeds.device)
+            results[modal] = {
+                "embeds": embeds,
+                "feat": feat,
+                "atts": atts
+            }
+
+        self._momentum_update()
         dynamic_inputs['is_momentum']=True
         model_m_config = self.build_config(**self.static_m_config, **dynamic_inputs)
-        results= {}
         results_m = {}
-        for modality, sub_cfgs in model_config.items():      # modality: prop, text, dist
-            for suffix, cfg in sub_cfgs.items():             # suffix: 2one, 2two
-                key = f"{modality}{suffix}"                  # ex: "prop2one"
-#                print(modality, cfg["model"])
-#                print(type(cfg["model"]) )
-                #feature from student model
-                encoder_model = cfg["model"].bert if modality == 'text' else cfg["model"]
-                embeds, feat, _ = extract_feature(
-                    encoder_model, cfg["proj"], cfg["queue"], cfg["inputs"], cfg["is_momentum"]
-                )
-                atts = torch.ones(embeds.size()[:-1], dtype=torch.long).to(embeds.device)
-                results[key] = {
-                    "embeds": embeds,
-                    "feat": feat,
-                    "atts": atts
-                }
-         
-                #feature from teacher model
-                self._momentum_update()
-                m_cfg = model_m_config[modality][suffix]
-                momentum_encoder = m_cfg["model"].bert if modality == 'text' else m_cfg["model"]
+        for modal in  model_m_config.keys():      # modality: prop, text, dist
+            m_encoder = model_m_config[modal]["model"].bert if modal == 'text' else model_m_config[modal]["model"]
             
-                m_embeds, m_feat, feat_all = extract_feature(
-                    momentum_encoder, m_cfg["proj"], cfg["queue"], cfg["inputs"], is_momentum=True
-                )
-                results_m[key] = {
-                    "m_embeds": m_embeds,
-                    "m_feat": m_feat,
-                    "m_feat_all": feat_all
-                }
+            m_embeds, m_feat, feat_all = extract_feature(
+                m_encoder, model_m_config[modal]["proj"], model_config[modal]["queue"], model_config[modal]["inputs"], is_momentum=True
+            )
+            results_m[modal] = {
+                "m_embeds": m_embeds,
+                "m_feat": m_feat,
+                "m_feat_all": feat_all
+            }
 
         #inter-modality
         inter_pairs = [
-            ('prop2one', 'text2two', 'p2t', 't2p'),
-            ('dist2two', 'text2one', 'd2t', 't2d'),
-            ('prop2two', 'dist2one', 'p2d', 'd2p'),
+            ('prop', 'text', 'p2t', 't2p'),
+            ('dist', 'text', 'd2t', 't2d'),
+            ('prop', 'dist', 'p2d', 'd2p'),
         ]
         sim_dict, loss_dict ={}, {} 
         for (res1_key, res2_key, sim1_prefix, sim2_prefix) in inter_pairs:
-            sim1, sim2, loss1, loss2 = self.contrastive_loss(
-                results[res1_key]['feat'], results[res2_key]['feat'],
-                results_m[res1_key]['m_feat'], results_m[res2_key]['m_feat'],
-                results_m[res1_key]['m_feat_all'], results_m[res2_key]['m_feat_all'],
-                alpha, self.temp
-            )
-
+            q_feats = (results[res1_key]['feat'], results_m[res1_key]['m_feat'], results_m[res1_key]['m_feat_all'])
+            k_feats = (results[res2_key]['feat'], results_m[res2_key]['m_feat'], results_m[res2_key]['m_feat_all'])
+            sim1, sim2, loss1, loss2 = self.contrastive_loss( q_feats, k_feats, alpha, self.temp, mode='inter' )
             if any(torch.isnan(x).any() for x in [sim1, sim2, loss1, loss2]):
                 sim1, sim2, loss1, loss2 = 0, 0, 0 , 0
             sim_dict[f'{sim1_prefix}'] = sim1
             sim_dict[f'{sim2_prefix}'] = sim2
             loss_dict[f'{sim1_prefix}'] =loss1
-            loss_dict[f'{sim1_prefix}'] =loss2
+            loss_dict[f'{sim2_prefix}'] =loss2
 
         intra_pairs = [
-            ('prop2one', 'prop2two', 'pp1', 'pp2'),
-            ('text2one', 'text2two', 'tt1', 'tt2'),
-            ('dist2one', 'dist2two', 'dd1', 'dd2')
+            ('prop', 'p2p'),
+            ('text', 't2t'),
+            ('dist', 'd2d'),
         ]
-        for (res1_key, res2_key, sim1_prefix, sim2_prefix) in intra_pairs:
-            sim1, sim2, loss1, loss2 = self.contrastive_loss(
-            results[res1_key]['feat'], results[res2_key]['feat'],
-            results_m[res1_key]['m_feat'], results_m[res2_key]['m_feat'],
-            results_m[res2_key]['m_feat_all'], results_m[res2_key]['m_feat_all'],
-            alpha, self.temp)
+        for (key, prefix) in intra_pairs:
+            q_feats = (results[key]['feat'], results_m[key]['m_feat'], results_m[key]['m_feat_all'])
+            sim_score, loss, = self.contrastive_loss( q_feats, alpha, self.temp, mode='intra')
 
-            if any(torch.isnan(x).any() for x in [sim1, sim2, loss1, loss2]):
-                sim1, sim2, loss1, loss2 = 0, 0, 0 , 0
-            sim_dict[f'{sim1_prefix}'] = sim1
-            sim_dict[f'{sim2_prefix}'] = sim2
-            loss_dict[f'{sim1_prefix}'] =loss1
-            loss_dict[f'{sim1_prefix}'] =loss2
-
+            if any(torch.isnan(x).any() for x in [sim_score, loss]):
+                sim_score, loss = 0 , 0
+            sim_dict[f'{prefix}'] = sim_score
+            loss_dict[f'{prefix}'] =loss
+        print(sim_dict.keys())
+        print(loss_dict.keys())
         all_loss  = sum(loss_dict.values() )
         loss_ita = all_loss * 0.5
         print('1111111111111111111 \n contrastive loss')
@@ -496,37 +475,35 @@ class SPMM(pl.LightningModule):
         else:
             return forward()
 
-    def contrastive_loss(self, 
-                         q_feat, k_feat,#student 
-                         q_feat_m, k_feat_m, #teacher
-                         q_feat_all, k_feat_all, #teacher
-                         alpha, temp):
-        """
-        args:
-            Q_feat: Tensor of shape (B, D), property features from student model
-            Q_feat_m: Tensor of shape (B, D), property features from teacher (momentum) model
-            K_feat_all: Tensor of shape (D, B+Bq), all text features from teacher model
-            alpha: float, soft vs. hard mixing ratio
-            temp: float, temperature scaling
-    
-        Returns:
-            loss_q2k: scalar tensor
-        """
-    
-        with torch.no_grad():
-            sim_q2k_m = q_feat_m @ k_feat_all / temp  # (B, B+Bq)
-            sim_k2q_m = k_feat_m @ q_feat_all / temp  # (B, B+Bq)
-            sim_targets = torch.zeros(sim_q2k_m.size(), device=q_feat.device)
-            sim_targets.fill_diagonal_(1)
-            sim_q2k_targets = alpha * F.softmax(sim_q2k_m, dim=1) + (1 - alpha) * sim_targets
-            sim_k2q_targets = alpha * F.softmax(sim_k2q_m, dim=1) + (1 - alpha) * sim_targets
-    
-        sim_q2k = q_feat @ k_feat_all / temp
-        sim_k2q = k_feat @ q_feat_all / temp
-        loss_q2k = -torch.sum(F.log_softmax(sim_q2k, dim=1) * sim_q2k_targets, dim=1).mean()
-        loss_k2q = -torch.sum(F.log_softmax(sim_k2q, dim=1) * sim_k2q_targets, dim=1).mean()
-    
-        return sim_q2k, sim_k2q, loss_q2k, loss_k2q
+    def contrastive_loss(self, q_feats, k_feats=None, alpha=0.5, temp=0.7, mode='intra'):
+        # from momentum model 
+        q_feat, q_feat_m, q_feat_all = q_feats
+        if mode == 'inter':
+            k_feat, k_feat_m, k_feat_all = k_feats
+            with torch.no_grad():
+                sim_q2k_m = q_feat_m @ k_feat_all / temp  # (B, B+Bq)
+                sim_k2q_m = k_feat_m @ q_feat_all / temp  # (B, B+Bq)
+                sim_targets = torch.zeros(sim_q2k_m.size(), device=q_feat.device)
+                sim_targets.fill_diagonal_(1)
+                sim_q2k_targets = alpha * F.softmax(sim_q2k_m, dim=1) + (1 - alpha) * sim_targets
+                sim_k2q_targets = alpha * F.softmax(sim_k2q_m, dim=1) + (1 - alpha) * sim_targets
+        
+            sim_q2k = q_feat @ k_feat_all / temp
+            sim_k2q = k_feat @ q_feat_all / temp
+            loss_q2k = -torch.sum(F.log_softmax(sim_q2k, dim=1) * sim_q2k_targets, dim=1).mean()
+            loss_k2q = -torch.sum(F.log_softmax(sim_k2q, dim=1) * sim_k2q_targets, dim=1).mean()
+        
+            return sim_q2k, sim_k2q, loss_q2k, loss_k2q
+        if mode == 'intra':
+            with torch.no_grad():
+                sim_q2q_m = q_feat_m @ q_feat_all / temp  # (B, B+Bq)
+                sim_targets = torch.zeros(sim_q2q_m.size(), device=q_feat.device)
+                sim_targets.fill_diagonal_(1)
+                sim_q2q_targets = alpha * F.softmax(sim_q2q_m, dim=1) + (1 - alpha) * sim_targets
+        
+            sim_q2q = q_feat @ q_feat_all / temp
+            loss_q2q = -torch.sum(F.log_softmax(sim_q2q, dim=1) * sim_q2q_targets, dim=1).mean()
+            return sim_q2q, loss_q2q
 
     def set_eval_mode(self):
         # for debugging
@@ -539,40 +516,34 @@ class SPMM(pl.LightningModule):
         torch.backends.cudnn.benchmark = False
         self.prop_encoder.eval()
         self.prop_mtr_head.eval()
-        self.prop2one_proj.eval()
-        self.prop2two_proj.eval()
+        self.prop_proj.eval()
         self.prop_embed.eval()
         self.text_encoder.eval()
         self.text_mtr_head.eval()
-        self.text2one_proj.eval()
-        self.text2two_proj.eval()
+        self.text_proj.eval()
         self.dist_encoder.eval()
         self.dist_mtr_head.eval()
-        self.dist2one_proj.eval()
-        self.dist2two_proj.eval()
+        self.dist_proj.eval()
         self.dist_embed_layer.eval()
         self.itm_head.eval()
         self.prop_encoder_m.eval()
-        self.prop2one_proj_m.eval()
-        self.prop2two_proj_m.eval()
+        self.prop_proj_m.eval()
         self.text_encoder_m.eval()
-        self.text2one_proj_m.eval()
-        self.text2two_proj_m.eval()
+        self.text_proj_m.eval()
         self.dist_encoder_m.eval()
-        self.dist2one_proj_m.eval()
-        self.dist2two_proj_m.eval()
+        self.dist_proj_m.eval()
 
     def init_modal(self,name,config,hidden_width, embed_dim, norm_eps=1e-12, is_momentum=False):
         if is_momentum:
-            encoder_m, pt_proj_m, pd_proj_m = create_unimodal_models(
+            encoder_m, proj_m = create_unimodal_models(
             config, hidden_width, embed_dim, norm_eps, is_momentum=True
             )
 
             setattr(self, f"{name}_encoder_m", encoder_m)
-            setattr(self, f"{name}2one_proj_m", pt_proj_m )
-            setattr(self, f"{name}2two_proj_m", pd_proj_m )
+            setattr(self, f"{name}_proj_m", proj_m )
+#            setattr(self, f"{name}2two_proj_m", pd_proj_m )
         else:
-            encoder, mtr_head, cls_token, mask_token,  pt_proj, pd_proj = create_unimodal_models(
+            encoder, mtr_head, cls_token, mask_token,  proj_layer = create_unimodal_models(
             config, hidden_width, embed_dim, norm_eps, is_momentum
             )
     
@@ -580,106 +551,56 @@ class SPMM(pl.LightningModule):
             setattr(self, f"{name}_mtr_head", mtr_head)
             setattr(self, f"{name}_cls", cls_token)
             setattr(self, f"{name}_mask", mask_token)
-            setattr(self, f"{name}2one_proj", pt_proj)
-            setattr(self, f"{name}2two_proj", pd_proj)
+            setattr(self, f"{name}_proj", proj_layer)
+#            setattr(self, f"{name}2two_proj", pd_proj)
 
     def _init_queue_buffer(self, prefix:str, embed_dim:int, queue_size:int):
-        for suffix in ['2one_queue', '2two_queue']:
-            name = f"{prefix}{suffix}"
-            self.register_buffer(name, torch.randn(embed_dim, queue_size) )
-            setattr(self, name, nn.functional.normalize(getattr(self, name), dim=0))
-
+        name= f'{prefix}_queue'
+        self.register_buffer(name, torch.randn(embed_dim, queue_size) )
+        setattr(self, name, nn.functional.normalize(getattr(self, name), dim=0))
     def build_config(self, **kwargs):
         if kwargs['is_momentum']== False: #student model
             return {
                 "prop": {
-                    "2one": {
                         "model": kwargs["prop_encoder"],
-                        "proj": kwargs["prop2one_proj"],
-                        "queue": kwargs["prop2one_queue"],
-                        "inputs": {"inputs_embeds": kwargs["prop"]["inputs_embeds"]},
-                        "is_momentum": kwargs["is_momentum"]
-                    },
-                    "2two": {
-                        "model": kwargs["prop_encoder"],
-                        "proj": kwargs["prop2two_proj"],
-                        "queue": kwargs["prop2two_queue"],
+                        "proj": kwargs["prop_proj"],
+                        "queue": kwargs["prop_queue"],
                         "inputs": {"inputs_embeds": kwargs["prop"]["inputs_embeds"]},
                         "is_momentum": kwargs['is_momentum']
                     },
-                },
                 "dist": {
-                    "2one": {
                         "model": kwargs["dist_encoder"],
-                        "proj": kwargs["dist2one_proj"],
-                        "queue": kwargs["dist2one_queue"],
+                        "proj": kwargs["dist_proj"],
+                        "queue": kwargs["dist_queue"],
                         "inputs": {"inputs_embeds": kwargs["dist"]["inputs_embeds"]},
                         "is_momentum": kwargs['is_momentum']
                     },
-                    "2two": {
-                        "model": kwargs["dist_encoder"],
-                        "proj": kwargs["dist2two_proj"],
-                        "queue": kwargs["dist2two_queue"],
-                        "inputs": {"inputs_embeds": kwargs["dist"]["inputs_embeds"]},
-                        "is_momentum": kwargs['is_momentum']
-                    },
-                },
                 "text": {
-                    "2one": {
                         "model": kwargs["text_encoder"],
-                        "proj": kwargs["text2one_proj"],
-                        "queue": kwargs["text2one_queue"],
+                        "proj": kwargs["text_proj"],
+                        "queue": kwargs["text_queue"],
                         "inputs": {"input_ids": kwargs['text']['input_ids'],
                                    "attention_mask": kwargs['text']['attention_mask'],
                                    "mode": kwargs['text']['mode']
                                   },
                         "is_momentum": kwargs['is_momentum']
                     },
-                    "2two": {
-                        "model": kwargs["text_encoder"],
-                        "proj": kwargs["text2two_proj"],
-                        "queue": kwargs["text2two_queue"],
-                        "inputs": {"input_ids": kwargs["text"]["input_ids"],
-                                   "attention_mask": kwargs["text"]["attention_mask"],
-                                   "mode": kwargs["text"]["mode"]
-                                  },
-                        "is_momentum": kwargs['is_momentum']
-                    },
-                },
-            }
+                   }
         else:#is_momentum=True, teacher model
             return {
                 "prop": {
-                    "2one": {
                         "model": kwargs["prop_encoder_m"],
-                        "proj": kwargs["prop2one_proj_m"],
-                    },
-                    "2two": {
-                        "model": kwargs["prop_encoder_m"],
-                        "proj": kwargs["prop2two_proj_m"],
-                    },
-                },
+                        "proj": kwargs["prop_proj_m"],
+                        },
                 "dist": {
-                    "2one": {
                         "model": kwargs["dist_encoder_m"],
-                        "proj": kwargs["dist2one_proj_m"],
+                        "proj": kwargs["dist_proj_m"],
                     },
-                    "2two": {
-                        "model": kwargs["dist_encoder_m"],
-                        "proj": kwargs["dist2two_proj_m"],
-                    },
-                },
                 "text": {
-                    "2one": {
                         "model": kwargs["text_encoder_m"],
-                        "proj": kwargs["text2one_proj_m"],
+                        "proj": kwargs["text_proj_m"],
                     },
-                    "2two": {
-                        "model": kwargs["text_encoder_m"],
-                        "proj": kwargs["text2two_proj_m"],
-                    },
-                },
-            }
+                }
 
 @torch.no_grad()
 def concat_all_gather(tensor):

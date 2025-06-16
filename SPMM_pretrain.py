@@ -64,10 +64,12 @@ if __name__ == '__main__':
 
     if args.debugging:
         from SPMM_debug_models import SPMM
+        #from bk_SPMM_debug_models import SPMM
         from debug_dataset import SMILESDataset_pretrain, collate_fn
     else:
         from SPMM_models import SPMM
-        from dataset import SMILESDataset_pretrain
+        #from dataset import SMILESDataset_pretrain
+        from debug_dataset import SMILESDataset_pretrain, collate_fn
 #    from SPMM_debug_models import SPMM
 
     pretrain_config = {
