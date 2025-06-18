@@ -14,27 +14,47 @@ def main(args, config):
     # data
     print("Creating dataset")
     #dataset = SMILESDataset_pretrain(args.data_path, data_length=[0, 50000000])
-    print('111111 start dataset')
-    st = time.time()
-    if (args.pkl is None):
-        dataset = SMILESDataset_pretrain(args.data_path)
-        with open('dataset.pkl', 'wb') as f:
-            pickle.dump(dataset, f)
-    else:
-        dataset = pickle.load(open(args.pkl, 'rb'))
-    et = time.time()
-    print('time for dataset', et-st)
-    print('#data:', len(dataset), torch.cuda.is_available())
-
-    if args.debugging:
-        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
-    else:
-        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True)
 
     tokenizer = BertTokenizer(vocab_file=args.vocab_filename, do_lower_case=False, do_basic_tokenize=False, add_special_tokens=False)
     tokenizer.wordpiece_tokenizer = WordpieceTokenizer(vocab=tokenizer.vocab, unk_token=tokenizer.unk_token, max_input_chars_per_word=250)
 
-    model = SPMM(config=config, tokenizer=tokenizer, loader_len=len(data_loader) // torch.cuda.device_count(), debugging=args.debugging)
+    if args.debugging:
+        from SPMM_debug_models import SPMM
+        from debug_dataset import SMILESDataset_pretrain, collate_fn
+        st = time.time()
+        if (args.pkl is None):
+            print('111111 start dataset')
+            dataset = SMILESDataset_pretrain(args.data_path)
+            with open('SMILESDataset.pkl', 'wb') as f:
+                pickle.dump(dataset, f)
+        else:
+            print('222222222222222')
+            dataset = pickle.load(open(args.pkl, 'rb'))
+        et = time.time()
+        print('time for dataset', et-st)
+        print('#data:', len(dataset), torch.cuda.is_available())
+        print('turn on debugging')
+        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+        model = SPMM(config=config, tokenizer=tokenizer, loader_len=len(data_loader) // torch.cuda.device_count(), debugging=args.debugging)
+    else:
+#        from SPMM_models import SPMM
+        from bk_SPMM_models import SPMM
+        from dataset import SMILESDataset_pretrain
+        st = time.time()
+        if (args.pkl is None):
+            print('111111 start dataset')
+            dataset = SMILESDataset_pretrain(args.data_path)
+            with open('SMILESDataset.pkl', 'wb') as f:
+                pickle.dump(dataset, f)
+        else:
+            print('222222222222222')
+            dataset = pickle.load(open(args.pkl, 'rb'))
+        et = time.time()
+        print('time for dataset', et-st)
+        print('#data:', len(dataset), torch.cuda.is_available())
+        print('turn off debugging')
+        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=0, shuffle=False, pin_memory=True, drop_last=True)
+        model = SPMM(config=config, tokenizer=tokenizer, loader_len=len(data_loader) // torch.cuda.device_count())
 
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location='cpu')
@@ -62,15 +82,6 @@ if __name__ == '__main__':
     parser.add_argument('--debugging', action='store_true', default=False)
     args = parser.parse_args()
 
-    if args.debugging:
-        from SPMM_debug_models import SPMM
-        #from bk_SPMM_debug_models import SPMM
-        from debug_dataset import SMILESDataset_pretrain, collate_fn
-    else:
-        from SPMM_models import SPMM
-        #from dataset import SMILESDataset_pretrain
-        from debug_dataset import SMILESDataset_pretrain, collate_fn
-#    from SPMM_debug_models import SPMM
 
     pretrain_config = {
         'property_width': 768,
@@ -88,5 +99,6 @@ if __name__ == '__main__':
                       'decay_rate': 1, 'warmup_lr': 5e-5, 'warmup_epochs': 20, 'cooldown_epochs': 0},
         'optimizer': {'opt': 'adamW', 'lr': 5e-5, 'weight_decay': 0.02},
     }
+
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args, pretrain_config)

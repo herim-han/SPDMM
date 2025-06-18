@@ -17,7 +17,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 class SMILESDataset_pretrain(Dataset):
     def __init__(self, data_path, data_length=None, shuffle=False):
-        self.smiles = [l.strip() for l in open(data_path).readlines()][:500]
+        self.smiles = [l.strip() for l in open(data_path).readlines()]
 
         with Pool(24) as p:
             results = list(tqdm(p.imap(data_preprocess, enumerate(self.smiles) ), total=len(self.smiles)) )
@@ -26,26 +26,12 @@ class SMILESDataset_pretrain(Dataset):
 
         if shuffle:
             random.shuffle(self.data)
-#        self.smiles, self.prop, self.atom_pair,self.dist = [],[],[],[]
-#        for i in range(len(data)):
-#            try:
-#                smiles = Chem.MolToSmiles(Chem.MolFromSmiles(data[i]), isomericSMiles=False, canonical=True)
-#                atom_pair = dist =get(data[i])
-#                prop = (calculate_property(data[i] - self.property_mean) / self.property_std
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, index):
         return self.data[index]
-#        try:
-#            smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]), isomericSmiles=False, canonical=True)
-#            properties = (calculate_property(smiles) - self.property_mean) / self.property_std
-#            atom_pair, dist = get_dist(smiles)
-##            print('atom pair/dist', atom_pair.dtype, dist.dtype)
-#            return properties, '[CLS]' + smiles, atom_pair, dist
-#        except Exception:
-#            return None
 
 def data_preprocess(args):
     idx, smiles = args
@@ -53,7 +39,6 @@ def data_preprocess(args):
     try:
         smiles = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), isomericSmiles=False, canonical=True)
         properties = (calculate_property(smiles) - property_mean) / property_std
-#        dist = get_dist(smiles)
         atom_set, dist = get_dist(smiles) or (None, None)
         return properties, '[CLS]' + smiles, atom_set, dist
     except Exception as e:

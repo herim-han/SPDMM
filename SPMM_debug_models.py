@@ -31,8 +31,6 @@ def extract_feature(model, linear_proj, queue, inputs, is_momentum=False): #defa
     def featurize():
         embeds = model(**inputs, return_dict=True).last_hidden_state
         feat = F.normalize(linear_proj(embeds[:, 0, :]), dim=-1) #prop_feat
-#        print(feat.device, queue.device, feat.shape, queue.shape)
-#        exit(-1)
         queue_on_device = queue.clone().detach().to(feat.device)
         feat_all = torch.cat([feat.t(), queue_on_device], dim=1) #feat_all
         return embeds, feat, feat_all
@@ -101,8 +99,15 @@ class SPMM(pl.LightningModule):
             self.loader_len = loader_len
             self.momentum = config['momentum']
             self.queue_size = config['queue_size']
-            for prefix in ['prop', 'text', 'dist']:
-                self._init_queue_buffer(prefix, embed_dim, self.queue_size)
+            self.register_buffer("prop_queue", torch.randn(embed_dim, self.queue_size) )
+            self.register_buffer("text_queue", torch.randn(embed_dim, self.queue_size) )
+            self.register_buffer("dist_queue", torch.randn(embed_dim, self.queue_size) )
+            self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long) )
+            self.prop_queue = nn.functional.normalize(self.prop_queue, dim=0)
+            self.text_queue = nn.functional.normalize(self.text_queue, dim=0)
+            self.dist_queue = nn.functional.normalize(self.dist_queue, dim=0)
+#            for prefix in ['prop', 'text', 'dist']:
+#                self._init_queue_buffer(prefix, embed_dim, self.queue_size)
 
         self.static_config = {
         "prop_encoder": self.prop_encoder,
@@ -131,20 +136,13 @@ class SPMM(pl.LightningModule):
         with torch.no_grad():
             self.temp.clamp_(0.01, 0.5) #all elements in range (min, max)
         #(B,len)>(B,len,embed_dim)
-        #property_feature = self.prop_embed(torch.tensor(property_original).unsqueeze(2)) 
         property_feature = self.prop_embed(property_original.clone().detach().unsqueeze(2))
-        #learnable empty tensor (B,len, embed_dim)
         unk_tokens = self.prop_mask.expand(property_original.size(0), property_original.size(1), -1)
-        # random masking (1 for mask, 0 for keep) > (B,len)
-        mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5)
-        # match dimension: (B,len)>(B,len,embed_dim)
-        mpm_mask_expand = mpm_mask.unsqueeze(2).repeat(1, 1, unk_tokens.size(2))
-        # replace masked tokens to filled 0 tensor (B, len, embed_dim)
-        property_masked = property_feature * (1 - mpm_mask_expand) + unk_tokens * mpm_mask_expand 
-        # add learnalble cls token > (B,len+1,embed_dim)
-        properties = torch.cat([self.prop_cls.expand(property_original.size(0), -1, -1), property_masked], dim=1)
+        mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5) #(B, len)
+        mpm_mask_expand = mpm_mask.unsqueeze(2).repeat(1, 1, unk_tokens.size(2)) #(B, len) > (B, len, embed_dim)
+        property_masked = property_feature * (1 - mpm_mask_expand) + unk_tokens * mpm_mask_expand #(B, len, embed_dim)
+        properties = torch.cat([self.prop_cls.expand(property_original.size(0), -1, -1), property_masked], dim=1) #(B, len+1, embed_dim)
 
-        #(B,len)>(B,len,embed_dim)
         dist_feature = self.dist_embed_layer(atom_pair, dist)
         unk_tokens   = self.dist_mask.expand(dist_feature.size(0), dist_feature.size(1), -1)#(B,len+1,embed_dim)
         mpm_mask     = torch.bernoulli(torch.ones_like(dist_feature) * 0.5)
@@ -155,7 +153,7 @@ class SPMM(pl.LightningModule):
         'prop': {"inputs_embeds": properties},
         'text': {"input_ids": text_input_ids,
                  "attention_mask": text_attention_mask,
-                 "mode": 'text'},
+                 "mode": 'text'},# !!! this mode only for 'text' encoder
         'dist': {"inputs_embeds": distances},
         'is_momentum':False
         }
@@ -168,6 +166,9 @@ class SPMM(pl.LightningModule):
                 e_model, model_config[modal]["proj"], model_config[modal]["queue"], model_config[modal]["inputs"], model_config[modal]["is_momentum"]
             )
             atts = torch.ones(embeds.size()[:-1], dtype=torch.long).to(embeds.device)
+#            print('!!!!!!!!!!!!! features from student models ', embeds.shape, feat.shape)
+            if modal == 'text':
+                atts = text_attention_mask
             results[modal] = {
                 "embeds": embeds,
                 "feat": feat,
@@ -184,6 +185,7 @@ class SPMM(pl.LightningModule):
             m_embeds, m_feat, feat_all = extract_feature(
                 m_encoder, model_m_config[modal]["proj"], model_config[modal]["queue"], model_config[modal]["inputs"], is_momentum=True
             )
+#            print('!!!!!!!!!!!!! features from momentum models ', m_embeds.shape, m_feat.shape, feat_all.shape)
             results_m[modal] = {
                 "m_embeds": m_embeds,
                 "m_feat": m_feat,
@@ -191,175 +193,82 @@ class SPMM(pl.LightningModule):
             }
 
         #inter-modality
-        inter_pairs = [
-            ('prop', 'text', 'p2t', 't2p'),
-            ('dist', 'text', 'd2t', 't2d'),
-            ('prop', 'dist', 'p2d', 'd2p'),
-        ]
+        inter_pairs = [ ('prop', 'text'), ('dist', 'text'), ('prop', 'dist') ]
         sim_dict, loss_dict ={}, {} 
-        for (res1_key, res2_key, sim1_prefix, sim2_prefix) in inter_pairs:
-            q_feats = (results[res1_key]['feat'], results_m[res1_key]['m_feat'], results_m[res1_key]['m_feat_all'])
-            k_feats = (results[res2_key]['feat'], results_m[res2_key]['m_feat'], results_m[res2_key]['m_feat_all'])
-            sim1, sim2, loss1, loss2 = self.contrastive_loss( q_feats, k_feats, alpha, self.temp, mode='inter' )
+        for (res1_key, res2_key) in inter_pairs:
+            sim1, sim2, loss1, loss2 = self.contrastive_loss( (results[res1_key]['feat'], results_m[res1_key]['m_feat'], results_m[res1_key]['m_feat_all']),
+                                                              (results[res2_key]['feat'], results_m[res2_key]['m_feat'], results_m[res2_key]['m_feat_all']),
+                                                              alpha, self.temp, mode='inter' )
             if any(torch.isnan(x).any() for x in [sim1, sim2, loss1, loss2]):
                 sim1, sim2, loss1, loss2 = 0, 0, 0 , 0
-            sim_dict[f'{sim1_prefix}'] = sim1
-            sim_dict[f'{sim2_prefix}'] = sim2
-            loss_dict[f'{sim1_prefix}'] =loss1
-            loss_dict[f'{sim2_prefix}'] =loss2
+            sim_dict[f'{res1_key}2{res2_key}'], sim_dict[f'{res2_key}2{res1_key}'] = sim1, sim2
+            loss_dict[f'{res1_key}2{res2_key}'],loss_dict[f'{res2_key}2{res1_key}'] =loss1, loss2
 
-        intra_pairs = [
-            ('prop', 'p2p'),
-            ('text', 't2t'),
-            ('dist', 'd2d'),
-        ]
-        for (key, prefix) in intra_pairs:
-            q_feats = (results[key]['feat'], results_m[key]['m_feat'], results_m[key]['m_feat_all'])
-            sim_score, loss, = self.contrastive_loss( q_feats, alpha, self.temp, mode='intra')
-
+        intra_pairs = [ 'prop', 'text', 'dist' ]
+        for key in intra_pairs:
+            sim_score, loss, = self.contrastive_loss( (results[key]['feat'], results_m[key]['m_feat'], results_m[key]['m_feat_all']), 
+                                                      alpha, self.temp, mode='intra')
             if any(torch.isnan(x).any() for x in [sim_score, loss]):
                 sim_score, loss = 0 , 0
-            sim_dict[f'{prefix}'] = sim_score
-            loss_dict[f'{prefix}'] =loss
-        print(sim_dict.keys())
-        print(loss_dict.keys())
+            sim_dict[f'{key}2{key}'], loss_dict[f'{key}2{key}'] = sim_score, loss
+
         all_loss  = sum(loss_dict.values() )
         loss_ita = all_loss * 0.5
-        print('1111111111111111111 \n contrastive loss')
+        
+        #Image-Text Matching (ITM)
+        loss_itm = {}
+        for (res1_key, res2_key) in inter_pairs:
+            print(f'Pair matching for {res1_key}, {res2_key}')
+            loss_itm[f'{res1_key}2{res2_key}'] = self.pair_matching(res1_key, res2_key, results, sim_dict)
+        self._dequeue_and_enqueue(results_m['prop']['m_feat'], results_m['text']['m_feat'], results_m['dist']['m_feat'])
 
-        # ================ ITM: Image-Text Matching ================= #
-        # forward the positve image(prop)-text pair
-        # cross attention: Q=prop, K,V=text
-        print(results.keys(), results['prop2one'].keys())
-        exit(-1)
-        pos_pos = self.cross_attention_pair(prop_embeds, prop_atts, text_embeds, text_attention_mask)
+        print(f'!!!!!!!! loss_itm {loss_itm}')
 
-        #hard negative mining: trained more using high similarity with negative sample
-        with torch.no_grad():
-            bs = properties.size(0) #current Batch (or current prop sequence order)
-            # hard
-            weights_i2t = F.softmax(sim_i2t[:, :bs], dim=1)
-            weights_t2i = F.softmax(sim_t2i[:, :bs], dim=1)
-
-            # weights_i2t[b][b]=0 : b-th prop to b-th text = 0
-            weights_i2t.fill_diagonal_(0)
-            weights_t2i.fill_diagonal_(0)
-
-        # select a negative image for each text
-        prop_embeds_neg = []
-        for b in range(bs):
-            neg_idx = torch.multinomial(weights_t2i[b], 1).item() #stochastic sampling (torch.argmax for deterministic sampling)
-            prop_embeds_neg.append(prop_embeds[neg_idx]) #negative sample "slice" (1, L, width) from prop_embeds = (B, L, width=768)
-        prop_embeds_neg = torch.stack(prop_embeds_neg, dim=0)
-
-        # select a negative text for each image
-        text_embeds_neg = []
-        text_atts_neg = []
-        for b in range(bs):
-            neg_idx = torch.multinomial(weights_i2t[b], 1).item()
-            text_embeds_neg.append(text_embeds[neg_idx])
-            text_atts_neg.append(text_attention_mask[neg_idx])
-        text_embeds_neg = torch.stack(text_embeds_neg, dim=0)
-        text_atts_neg = torch.stack(text_atts_neg, dim=0)
-
-        # positive + negative sample feature
-        text_embeds_all = torch.cat([text_embeds, text_embeds_neg], dim=0)
-        text_atts_all = torch.cat([text_attention_mask, text_atts_neg], dim=0)
-        # negative + positive sample feature
-        prop_embeds_all = torch.cat([prop_embeds_neg, prop_embeds], dim=0)
-        prop_atts_all = torch.cat([prop_atts, prop_atts], dim=0)
-
-        # cross attention: additional update using combination of positive and negative sample 
-        # encoder-only (bert, using full tokens, bidirectional context, extract features)
-        pos_neg = self.cross_attention_pair(prop_embeds_all, prop_atts_all, text_embeds_all, text_atts_all)
-
-        # positive-positive pair (B, 2D), positive-negative pair (2*B, 2D)
-        vl_embeddings = torch.cat([pos_pos, pos_neg], dim=0)
-        # binary classification for pair (2*B, 2) itm_head=MLP head (nn.Linear)
-        vl_output = self.itm_head(vl_embeddings)
-        # True label for predicting pair
-        #print(bs)
-        itm_labels = torch.cat([torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
-                               dim=0).to(properties.device)
-        loss_itm = F.cross_entropy(vl_output, itm_labels)
-
-        # adding queue from momentum teacher feature in the Batch
-        self._dequeue_and_enqueue(prop_feat_m, text_feat_m)
-
-        # ================= MLM: Masked Language Modeling + teacher distillation ================= #
-        # Auto-regressive text prediction
+        #Auto-regressive Text (Conditional MLM + KD)
         input_ids = text_input_ids.clone() #(B, L)
         labels = input_ids.clone()[:, 1:] # (B, L-1), shifted target (target for t+1)
-
-        with torch.no_grad():
-        # Decoder-style, Language Modeling (causal, no text-masking)
-            logits_m = self.text_encoder_m(input_ids,
-                                           attention_mask=text_attention_mask,
-                                           encoder_hidden_states=prop_embeds_m, #Q, V (prop for conditioning context)
-                                           encoder_attention_mask=prop_atts,
-                                           return_dict=True,
-                                           is_decoder=True, #cross attention + causal mask
-                                           return_logits=True,
-                                           )[:, :-1, :] #(B, L-1, dim)
-
-        mlm_output = self.text_encoder(input_ids,
-                                       attention_mask=text_attention_mask,
-                                       encoder_hidden_states=prop_embeds,
-                                       encoder_attention_mask=prop_atts,
-                                       return_dict=True,
-                                       is_decoder=True,#1.causal mask=use only previous tokens 2. cross-attention
-                                       return_logits=True,
-                                       )[:, :-1, :]
-
-        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-        loss_mlm = loss_fct(mlm_output.permute((0, 2, 1)), labels)
-
-        # kl loss between two distributions (student output-F.log_softmax, teacher output-logits_m)
-        loss_distill_text = -torch.sum(F.log_softmax(mlm_output, dim=-1) * F.softmax(logits_m, dim=-1), dim=-1)
-        loss_distill_text = loss_distill_text[labels != 0].mean()
-        # loss_mlm from student model (hard target) and kl loss (soft target)
-        loss_mlm = (1 - alpha) * loss_mlm + alpha * loss_distill_text
+        text_features = (input_ids, labels, results['text']['atts'])
+        loss_mlm = {}
+        for key in ['prop', 'dist']:
+            print(f'Conditional MLM prediction {key}')
+            conditional = (results[key]['embeds'], results[key]['atts'], results_m[key]['m_embeds'])
+            loss_mlm[f'{key}2text'] = self.mlm_prediction(text_features, conditional, alpha)
+        print(f'@@@@@@@@ loss_mlm {loss_mlm}')
 
         # ================= MPM ================= #
         target = property_original.clone()
-        # properties = cls + masked prop sequence, is_decoder: autoregressive prediction (use only previous tokens)
-        prop_embeds_causal = self.property_encoder(inputs_embeds=properties, is_decoder=True, return_dict=True).last_hidden_state
-
-        # Encoder-style, Recovery masked prop (non-causal, random)
-        prop_output = self.text_encoder.bert(encoder_embeds=prop_embeds_causal, #input: prop
-                                             attention_mask=prop_atts,
-                                             encoder_hidden_states=text_embeds, #condition: text (for cross attention)
-                                             encoder_attention_mask=text_attention_mask,
-                                             return_dict=True,
-                                             is_decoder=True,#1.causal mask 2. **cross-attention -> but real, non-causal, bidirectional masked pred
-                                             mode='fusion',
-                                             ).last_hidden_state[:, :-1, :]
-
-        pred = self.property_mtr_head(prop_output).squeeze()
-
-        lossfn = nn.MSELoss()
-        # idx slicing from masking (above : mpm_mask = 1 for mask, 0 for keep, 0.5=masking ratio (B, L))
-        loss_mpm = lossfn(pred[(1 - mpm_mask).to(bool)], target[(1 - mpm_mask).to(bool)])
+        text_features = (results['text']['embeds'], results['text']['atts'])
+        loss_mpm = {}
+        for key in ['prop', 'dist']:
+            prop_features = (dynamic_inputs[key]["inputs_embeds"], results[key]['atts'] )
+            loss_mpm[key] = self.mpm_prediction(text_features, 
+                                                prop_features, 
+                                                model_config[key]["model"], 
+                                                model_config[modal]["model"])
 
         return loss_mlm, loss_mpm * 5, loss_ita, loss_itm
 
     @torch.no_grad()
     def copy_params(self):
         for model_pair in self.model_pairs:
-            for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
+            for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):#student, momentum
                 param_m.data.copy_(param.data)  # initialize
                 param_m.requires_grad = False  # not update by gradient
 
     @torch.no_grad()
     def _momentum_update(self):
+        '''
+        param_m = lambda * param_m + (1-lambda)*param
+        '''
         for model_pair in self.model_pairs:
-            for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
+            for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):#student, momentum
                 param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
 
     @torch.no_grad()
-    def _dequeue_and_enqueue(self, img_feat, text_feat):
+    def _dequeue_and_enqueue(self, img_feat, text_feat, dist_feat):
         img_feats = concat_all_gather(img_feat)
         text_feats = concat_all_gather(text_feat)
+        dist_feats = concat_all_gather(dist_feat)
 
         batch_size = img_feats.shape[0]
 
@@ -370,6 +279,7 @@ class SPMM(pl.LightningModule):
         # replace the keys at ptr (dequeue and enqueue)
         self.prop_queue[:, ptr:ptr + batch_size] = img_feats.T
         self.text_queue[:, ptr:ptr + batch_size] = text_feats.T
+        self.dist_queue[:, ptr:ptr + batch_size] = dist_feats.T
         ptr = (ptr + batch_size) % self.queue_size  # move pointer
 
         self.queue_ptr[0] = ptr
@@ -439,6 +349,103 @@ class SPMM(pl.LightningModule):
             print(f'\n mean loss: {tmp[0]:.4f}, {tmp[1]:.4f}, {tmp[2]:.4f}, {tmp[3]:.4f}')
         self.training_step_outputs.clear()
 
+    def pair_matching(self, pair1, pair2, results, sim_dict):
+        #pair1=prop , pair2=text 
+        pos_pos = self.cross_attention_pair(results[pair1]['embeds'], results[pair1]['atts'], results[pair2]['embeds'], results[pair2]['atts'])
+        with torch.no_grad():
+            bs = results[pair1]['embeds'].size(0) #current Batch
+            weights_i2t = F.softmax(sim_dict[f'{pair1}2{pair2}'][:, :bs], dim=1)
+            weights_t2i = F.softmax(sim_dict[f'{pair2}2{pair1}'][:, :bs], dim=1)
+
+            weights_i2t.fill_diagonal_(0)
+            weights_t2i.fill_diagonal_(0)
+
+        prop_embeds_neg = []
+        for b in range(bs):
+            neg_idx = torch.multinomial(weights_t2i[b], 1).item() #stochastic sampling (torch.argmax for deterministic sampling)
+            prop_embeds_neg.append(results[pair1]['embeds'][neg_idx]) #negative sample "slice" (1, L, width) from prop_embeds = (B, L, width=768)
+        prop_embeds_neg = torch.stack(prop_embeds_neg, dim=0)
+
+        text_embeds_neg = []
+        text_atts_neg = []
+        for b in range(bs):
+            neg_idx = torch.multinomial(weights_i2t[b], 1).item()
+            text_embeds_neg.append(results[pair2]['embeds'][neg_idx])
+            text_atts_neg.append(results[pair2]['atts'][neg_idx])
+        text_embeds_neg = torch.stack(text_embeds_neg, dim=0)
+        text_atts_neg = torch.stack(text_atts_neg, dim=0)
+
+        text_embeds_all = torch.cat([results[pair2]['embeds'], text_embeds_neg], dim=0)
+        text_atts_all = torch.cat([results[pair2]['atts'], text_atts_neg], dim=0)
+
+        prop_embeds_all = torch.cat([prop_embeds_neg, results[pair1]['embeds']], dim=0)
+        prop_atts_all = torch.cat([results[pair1]['atts'], results[pair1]['atts']], dim=0)
+
+        pos_neg = self.cross_attention_pair(prop_embeds_all, prop_atts_all, text_embeds_all, text_atts_all)
+        vl_embeddings = torch.cat([pos_pos, pos_neg], dim=0)
+        # binary classification for pair (2*B, 2) itm_head=MLP head (nn.Linear)
+        vl_output = self.itm_head(vl_embeddings)
+        devices = results[pair1]['atts'].device
+        itm_labels = torch.cat([torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
+                               dim=0).to(devices)
+        loss_itm = F.cross_entropy(vl_output, itm_labels)
+        return loss_itm
+
+    def mlm_prediction(self, text_feature, conditional, alpha):
+        input_ids, labels, text_attention_mask = text_feature
+        prop_embeds, prop_atts, prop_embeds_m = conditional
+        # ================= MLM: Masked Language Modeling + teacher distillation ================= #
+        # Auto-regressive text prediction
+
+        with torch.no_grad():
+        # Decoder-style, Language Modeling (causal, no text-masking)
+            logits_m = self.text_encoder_m(input_ids,
+                                           attention_mask=text_attention_mask,
+                                           encoder_hidden_states=prop_embeds_m, #Q, V (prop for conditioning context)
+                                           encoder_attention_mask=prop_atts,
+                                           return_dict=True,
+                                           is_decoder=True, #cross attention + causal mask
+                                           return_logits=True,
+                                           )[:, :-1, :] #(B, L-1, dim)
+
+        mlm_output = self.text_encoder(input_ids,
+                                       attention_mask=text_attention_mask,
+                                       encoder_hidden_states=prop_embeds,
+                                       encoder_attention_mask=prop_atts,
+                                       return_dict=True,
+                                       is_decoder=True,#1.causal mask=use only previous tokens 2. cross-attention
+                                       return_logits=True,
+                                       )[:, :-1, :]
+
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+        loss_mlm = loss_fct(mlm_output.permute((0, 2, 1)), labels)
+
+        loss_distill_text = -torch.sum(F.log_softmax(mlm_output, dim=-1) * F.softmax(logits_m, dim=-1), dim=-1)
+        loss_distill_text = loss_distill_text[labels != 0].mean()
+
+        return (1 - alpha) * loss_mlm + alpha * loss_distill_text
+
+    def mpm_prediction(self, text_feature, prop_feature, encoder, mtr_head_model):
+        # properties = cls + masked prop sequence, is_decoder: autoregressive prediction (use only previous tokens)
+        properties, prop_atts = prop_feature
+        text_embes, test_attention_mask = text_feature
+
+        prop_embeds_causal = encoder(inputs_embeds=properties, is_decoder=True, return_dict=True).last_hidden_state
+        # Encoder-style, Recovery masked prop (non-causal, random)
+        prop_output = self.text_encoder.bert(encoder_embeds=prop_embeds_causal, #input: prop
+                                             attention_mask=prop_atts,
+                                             encoder_hidden_states=text_embeds, #condition: text (for cross attention)
+                                             encoder_attention_mask=text_attention_mask,
+                                             return_dict=True,
+                                             is_decoder=True,#1.causal mask 2. **cross-attention -> but real, non-causal, bidirectional masked pred
+                                             mode='fusion',
+                                             ).last_hidden_state[:, :-1, :]
+
+        pred = mtr_head_model(prop_output).squeeze()
+
+        lossfn = nn.MSELoss()
+        # idx slicing from masking (above : mpm_mask = 1 for mask, 0 for keep, 0.5=masking ratio (B, L))
+        return lossfn(pred[(1 - mpm_mask).to(bool)], target[(1 - mpm_mask).to(bool)])
 
     def cross_attention_pair(self, q_embeds, q_atts, k_embeds, k_atts):
         # all modality integrated text_encoder.bert > tri-modal cross attention
@@ -492,8 +499,8 @@ class SPMM(pl.LightningModule):
             sim_k2q = k_feat @ q_feat_all / temp
             loss_q2k = -torch.sum(F.log_softmax(sim_q2k, dim=1) * sim_q2k_targets, dim=1).mean()
             loss_k2q = -torch.sum(F.log_softmax(sim_k2q, dim=1) * sim_k2q_targets, dim=1).mean()
-        
             return sim_q2k, sim_k2q, loss_q2k, loss_k2q
+
         if mode == 'intra':
             with torch.no_grad():
                 sim_q2q_m = q_feat_m @ q_feat_all / temp  # (B, B+Bq)
@@ -558,6 +565,7 @@ class SPMM(pl.LightningModule):
         name= f'{prefix}_queue'
         self.register_buffer(name, torch.randn(embed_dim, queue_size) )
         setattr(self, name, nn.functional.normalize(getattr(self, name), dim=0))
+
     def build_config(self, **kwargs):
         if kwargs['is_momentum']== False: #student model
             return {
