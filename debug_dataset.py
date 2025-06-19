@@ -41,6 +41,7 @@ def data_preprocess(args):
         properties = (calculate_property(smiles) - property_mean) / property_std
         atom_set, dist = get_dist(smiles) or (None, None)
         return properties, '[CLS]' + smiles, atom_set, dist
+
     except Exception as e:
         print(f"Failed processing {idx} {smiles}: {e}")
         return None

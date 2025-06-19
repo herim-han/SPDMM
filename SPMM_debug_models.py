@@ -106,8 +106,6 @@ class SPMM(pl.LightningModule):
             self.prop_queue = nn.functional.normalize(self.prop_queue, dim=0)
             self.text_queue = nn.functional.normalize(self.text_queue, dim=0)
             self.dist_queue = nn.functional.normalize(self.dist_queue, dim=0)
-#            for prefix in ['prop', 'text', 'dist']:
-#                self._init_queue_buffer(prefix, embed_dim, self.queue_size)
 
         self.static_config = {
         "prop_encoder": self.prop_encoder,
@@ -119,6 +117,8 @@ class SPMM(pl.LightningModule):
         "prop_queue": self.prop_queue,
         "text_queue": self.text_queue,
         "dist_queue": self.dist_queue,
+        "prop_mtr": self.prop_mtr_head,
+        "dist_mtr": self.dist_mtr_head,
         }
         self.static_m_config = {
         "prop_encoder_m": self.prop_encoder_m,
@@ -131,23 +131,23 @@ class SPMM(pl.LightningModule):
 
     def forward(self, property_original, text_input_ids, text_attention_mask, atom_pair, dist, alpha=0):
         if self.debugging:
-            print('\n \n \n turn on debugging mode')
             self.set_eval_mode()
         with torch.no_grad():
             self.temp.clamp_(0.01, 0.5) #all elements in range (min, max)
         #(B,len)>(B,len,embed_dim)
         property_feature = self.prop_embed(property_original.clone().detach().unsqueeze(2))
         unk_tokens = self.prop_mask.expand(property_original.size(0), property_original.size(1), -1)
-        mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5) #(B, len)
-        mpm_mask_expand = mpm_mask.unsqueeze(2).repeat(1, 1, unk_tokens.size(2)) #(B, len) > (B, len, embed_dim)
+        prop_mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5) #(B, len)
+        mpm_mask_expand = prop_mpm_mask.unsqueeze(2).repeat(1, 1, unk_tokens.size(2)) #(B, len) > (B, len, embed_dim)
         property_masked = property_feature * (1 - mpm_mask_expand) + unk_tokens * mpm_mask_expand #(B, len, embed_dim)
         properties = torch.cat([self.prop_cls.expand(property_original.size(0), -1, -1), property_masked], dim=1) #(B, len+1, embed_dim)
-
+         
         dist_feature = self.dist_embed_layer(atom_pair, dist)
         unk_tokens   = self.dist_mask.expand(dist_feature.size(0), dist_feature.size(1), -1)#(B,len+1,embed_dim)
-        mpm_mask     = torch.bernoulli(torch.ones_like(dist_feature) * 0.5)
-        dist_mask    = dist_feature * (1-mpm_mask) + unk_tokens * mpm_mask
-        distances    = torch.cat([self.dist_cls.expand(dist_feature.size(0), -1,-1), dist_mask], dim=1)#(B,len+1,embed_dim)
+        dist_mpm_mask  = torch.bernoulli(torch.ones_like(dist) * 0.5)
+        mpm_mask_expand = dist_mpm_mask.unsqueeze(2).repeat(1, 1, unk_tokens.size(2))
+        dist_masked = dist_feature * (1 - mpm_mask_expand) + unk_tokens * mpm_mask_expand #(B, len, embed_dim)
+        distances    = torch.cat([self.dist_cls.expand(dist_feature.size(0), -1,-1), dist_masked], dim=1)#(B,len+1,embed_dim)
 
         dynamic_inputs = {
         'prop': {"inputs_embeds": properties},
@@ -174,7 +174,6 @@ class SPMM(pl.LightningModule):
                 "feat": feat,
                 "atts": atts
             }
-
         self._momentum_update()
         dynamic_inputs['is_momentum']=True
         model_m_config = self.build_config(**self.static_m_config, **dynamic_inputs)
@@ -196,8 +195,12 @@ class SPMM(pl.LightningModule):
         inter_pairs = [ ('prop', 'text'), ('dist', 'text'), ('prop', 'dist') ]
         sim_dict, loss_dict ={}, {} 
         for (res1_key, res2_key) in inter_pairs:
-            sim1, sim2, loss1, loss2 = self.contrastive_loss( (results[res1_key]['feat'], results_m[res1_key]['m_feat'], results_m[res1_key]['m_feat_all']),
-                                                              (results[res2_key]['feat'], results_m[res2_key]['m_feat'], results_m[res2_key]['m_feat_all']),
+            sim1, sim2, loss1, loss2 = self.contrastive_loss( (results[res1_key]['feat'], 
+                                                               results_m[res1_key]['m_feat'], 
+                                                               results_m[res1_key]['m_feat_all']),
+                                                              (results[res2_key]['feat'], 
+                                                               results_m[res2_key]['m_feat'], 
+                                                               results_m[res2_key]['m_feat_all']),
                                                               alpha, self.temp, mode='inter' )
             if any(torch.isnan(x).any() for x in [sim1, sim2, loss1, loss2]):
                 sim1, sim2, loss1, loss2 = 0, 0, 0 , 0
@@ -206,7 +209,9 @@ class SPMM(pl.LightningModule):
 
         intra_pairs = [ 'prop', 'text', 'dist' ]
         for key in intra_pairs:
-            sim_score, loss, = self.contrastive_loss( (results[key]['feat'], results_m[key]['m_feat'], results_m[key]['m_feat_all']), 
+            sim_score, loss, = self.contrastive_loss( (results[key]['feat'], 
+                                                       results_m[key]['m_feat'], 
+                                                       results_m[key]['m_feat_all']), 
                                                       alpha, self.temp, mode='intra')
             if any(torch.isnan(x).any() for x in [sim_score, loss]):
                 sim_score, loss = 0 , 0
@@ -218,11 +223,8 @@ class SPMM(pl.LightningModule):
         #Image-Text Matching (ITM)
         loss_itm = {}
         for (res1_key, res2_key) in inter_pairs:
-            print(f'Pair matching for {res1_key}, {res2_key}')
             loss_itm[f'{res1_key}2{res2_key}'] = self.pair_matching(res1_key, res2_key, results, sim_dict)
         self._dequeue_and_enqueue(results_m['prop']['m_feat'], results_m['text']['m_feat'], results_m['dist']['m_feat'])
-
-        print(f'!!!!!!!! loss_itm {loss_itm}')
 
         #Auto-regressive Text (Conditional MLM + KD)
         input_ids = text_input_ids.clone() #(B, L)
@@ -230,23 +232,24 @@ class SPMM(pl.LightningModule):
         text_features = (input_ids, labels, results['text']['atts'])
         loss_mlm = {}
         for key in ['prop', 'dist']:
-            print(f'Conditional MLM prediction {key}')
             conditional = (results[key]['embeds'], results[key]['atts'], results_m[key]['m_embeds'])
             loss_mlm[f'{key}2text'] = self.mlm_prediction(text_features, conditional, alpha)
-        print(f'@@@@@@@@ loss_mlm {loss_mlm}')
 
         # ================= MPM ================= #
-        target = property_original.clone()
         text_features = (results['text']['embeds'], results['text']['atts'])
         loss_mpm = {}
-        for key in ['prop', 'dist']:
-            prop_features = (dynamic_inputs[key]["inputs_embeds"], results[key]['atts'] )
+        for (key, mask, targets) in [('prop', prop_mpm_mask, property_original.clone()), ('dist', dist_mpm_mask, dist.clone())]:
+            prop_features = (dynamic_inputs[key]["inputs_embeds"], results[key]['atts'], mask, targets)
             loss_mpm[key] = self.mpm_prediction(text_features, 
-                                                prop_features, 
+                                                prop_features,
                                                 model_config[key]["model"], 
-                                                model_config[modal]["model"])
-
-        return loss_mlm, loss_mpm * 5, loss_ita, loss_itm
+                                                model_config[key]["mtr_head"])
+        #dictionary type for loss_mlm, loss_mpm, loss_itm 
+#        print('loss_mlm', sum(loss_mlm.values()))
+#        print('loss_mpm', sum(loss_mpm.values())*5)
+#        print('loss_ita', loss_ita)
+#        print('loss_itm', sum(loss_itm.values()))
+        return sum(loss_mlm.values()), sum(loss_mpm.values()) * 5, loss_ita, sum(loss_itm.values())
 
     @torch.no_grad()
     def copy_params(self):
@@ -273,7 +276,7 @@ class SPMM(pl.LightningModule):
         batch_size = img_feats.shape[0]
 
         ptr = int(self.queue_ptr)
-        print('queue/batch size',self.queue_size, batch_size)
+        #print('queue/batch size',self.queue_size, batch_size)
         assert self.queue_size % batch_size == 0  # for simplicity
 
         # replace the keys at ptr (dequeue and enqueue)
@@ -303,13 +306,7 @@ class SPMM(pl.LightningModule):
         # self.tokenizer = BertTokenizer from transformers
         # text_input contained two [CLS] token
         text_input = self.tokenizer(text, padding='longest', truncation=True, max_length=100, return_tensors="pt").to(prop.device)
-#        print(text_input)
-#        
-#        print(text_input.input_ids[0].shape)
-#        print(text_input.input_ids[6].shape)
-#        print(dist)
-#        print(type(dist), dist.shape)
-#        exit(-1)
+
         #warm up lr
         alpha = self.config['alpha'] if self.current_epoch > 0 else self.config['alpha'] * min(1., batch_idx / self.loader_len)
 
@@ -418,7 +415,7 @@ class SPMM(pl.LightningModule):
                                        )[:, :-1, :]
 
         loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-        loss_mlm = loss_fct(mlm_output.permute((0, 2, 1)), labels)
+        loss_mlm = loss_fct(mlm_output.permute((0, 2, 1)), labels) #tensor transpose
 
         loss_distill_text = -torch.sum(F.log_softmax(mlm_output, dim=-1) * F.softmax(logits_m, dim=-1), dim=-1)
         loss_distill_text = loss_distill_text[labels != 0].mean()
@@ -427,8 +424,8 @@ class SPMM(pl.LightningModule):
 
     def mpm_prediction(self, text_feature, prop_feature, encoder, mtr_head_model):
         # properties = cls + masked prop sequence, is_decoder: autoregressive prediction (use only previous tokens)
-        properties, prop_atts = prop_feature
-        text_embes, test_attention_mask = text_feature
+        properties, prop_atts, mpm_mask, target = prop_feature
+        text_embeds, text_attention_mask = text_feature
 
         prop_embeds_causal = encoder(inputs_embeds=properties, is_decoder=True, return_dict=True).last_hidden_state
         # Encoder-style, Recovery masked prop (non-causal, random)
@@ -442,7 +439,6 @@ class SPMM(pl.LightningModule):
                                              ).last_hidden_state[:, :-1, :]
 
         pred = mtr_head_model(prop_output).squeeze()
-
         lossfn = nn.MSELoss()
         # idx slicing from masking (above : mpm_mask = 1 for mask, 0 for keep, 0.5=masking ratio (B, L))
         return lossfn(pred[(1 - mpm_mask).to(bool)], target[(1 - mpm_mask).to(bool)])
@@ -524,13 +520,13 @@ class SPMM(pl.LightningModule):
         self.prop_encoder.eval()
         self.prop_mtr_head.eval()
         self.prop_proj.eval()
-        self.prop_embed.eval()
         self.text_encoder.eval()
         self.text_mtr_head.eval()
         self.text_proj.eval()
         self.dist_encoder.eval()
         self.dist_mtr_head.eval()
         self.dist_proj.eval()
+        self.prop_embed.eval()
         self.dist_embed_layer.eval()
         self.itm_head.eval()
         self.prop_encoder_m.eval()
@@ -573,6 +569,7 @@ class SPMM(pl.LightningModule):
                         "model": kwargs["prop_encoder"],
                         "proj": kwargs["prop_proj"],
                         "queue": kwargs["prop_queue"],
+                        "mtr_head": kwargs["prop_mtr"],
                         "inputs": {"inputs_embeds": kwargs["prop"]["inputs_embeds"]},
                         "is_momentum": kwargs['is_momentum']
                     },
@@ -580,6 +577,7 @@ class SPMM(pl.LightningModule):
                         "model": kwargs["dist_encoder"],
                         "proj": kwargs["dist_proj"],
                         "queue": kwargs["dist_queue"],
+                        "mtr_head": kwargs["dist_mtr"],
                         "inputs": {"inputs_embeds": kwargs["dist"]["inputs_embeds"]},
                         "is_momentum": kwargs['is_momentum']
                     },
@@ -655,12 +653,8 @@ class Embed3DStruct(torch.nn.Module):
         #self.cls_token = nn.Parameter(torch.zeros(1, 1, self.pair_embed_length))
 
     def forward(self, pair_symbols, distances):
-#        print(pair_symbols.shape, pair_symbols.device)
         pair_symbol_feat = self.pair_symbol_embed(pair_symbols)  # (B, N_maxpair, embed_length)
-#        print(pair_symbol_feat.shape, pair_symbol_feat.divice)
         dist_feat = self.dist_embed(distances)
         embed_feat = torch.cat([ pair_symbol_feat, dist_feat], -1)
-#        cls_embed_feat = torch.cat([self.cls_token.expand(embed_feat.size(0), -1, -1), embed_feat], dim=1)
 
-        #return self.encoder_layer( feat ).permute(1,0,2) #(N_maxpair, B, embed_legnth)
         return embed_feat
