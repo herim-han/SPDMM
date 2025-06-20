@@ -245,10 +245,6 @@ class SPMM(pl.LightningModule):
                                                 model_config[key]["model"], 
                                                 model_config[key]["mtr_head"])
         #dictionary type for loss_mlm, loss_mpm, loss_itm 
-#        print('loss_mlm', sum(loss_mlm.values()))
-#        print('loss_mpm', sum(loss_mpm.values())*5)
-#        print('loss_ita', loss_ita)
-#        print('loss_itm', sum(loss_itm.values()))
         return sum(loss_mlm.values()), sum(loss_mpm.values()) * 5, loss_ita, sum(loss_itm.values())
 
     @torch.no_grad()
@@ -314,6 +310,11 @@ class SPMM(pl.LightningModule):
         #loss_mlm, loss_mpm, loss_ita, loss_itm = self(prop, text_input.input_ids[:, 1:], text_input.attention_mask[:, 1:], alpha=alpha)
         # w/ line 288 tokenization_bert.py // return tokens + [SEP]
         loss_mlm, loss_mpm, loss_ita, loss_itm = self(prop, text_input.input_ids, text_input.attention_mask, atom_pair, dist, alpha=alpha)
+        print('loss_mlm', loss_mlm)
+        print('loss_mpm', loss_mpm)
+        print('loss_ita', loss_ita)
+        print('loss_itm', loss_itm)
+
         loss = loss_mlm + loss_mpm + loss_ita + loss_itm
         if loss != torch.tensor(0.):
             self.manual_backward(loss)

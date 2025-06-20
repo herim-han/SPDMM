@@ -9,8 +9,8 @@ import time
 import pickle
 
 def main(args, config):
-    CUDA_LAUNCH_BLOCKING=1
-    ngpu=1
+    #CUDA_LAUNCH_BLOCKING=1
+    #ngpu=1
     # data
     print("Creating dataset")
     #dataset = SMILESDataset_pretrain(args.data_path, data_length=[0, 50000000])
@@ -64,8 +64,13 @@ def main(args, config):
     checkpoint_callback = pl.callbacks.ModelCheckpoint(dirpath=args.output_dir, filename='checkpoint_{epoch}',
                                                        every_n_train_steps=10000,
                                                        )
-    trainer = pl.Trainer(accelerator='gpu', devices=ngpu, precision='16-mixed', max_epochs=config['schedular']['epochs'],
+    trainer = pl.Trainer(accelerator='gpu', devices=2, precision='16-mixed', max_epochs=config['schedular']['epochs'],
                          callbacks=[checkpoint_callback], strategy=DDPStrategy(find_unused_parameters=True), limit_val_batches=0.)
+#    trainer = pl.Trainer(accelerator=args.accelerator, 
+#                         devices=args.gpus, 
+#                         max_epochs=config['schedular']['epochs'],
+#                         callbacks=[checkpoint_callback], 
+#                         strategy=args.strategy, )
     trainer.fit(model, data_loader, None, ckpt_path=args.checkpoint if args.checkpoint else None)
 
 
@@ -80,13 +85,17 @@ if __name__ == '__main__':
     parser.add_argument('--vocab_filename', default='./vocab_bpe_300.txt')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--debugging', action='store_true', default=False)
+    parser.add_argument('--accelerator', type=str, default='gpu')
+    parser.add_argument('--gpus', type=int, default=1)
+    parser.add_argument('--strategy', type=str, default='auto')
+
     args = parser.parse_args()
 
 
     pretrain_config = {
         'property_width': 768,
         'embed_dim': 256,
-        'batch_size': 16,
+        'batch_size': 24,
         #'batch_size': 96,
         'temp': 0.07,
         'mlm_probability': 0.15,
