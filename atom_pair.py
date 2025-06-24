@@ -12,8 +12,9 @@ from multiprocessing import Pool
 atom_pair_index = pickle.load(open('atom_pair_vocab.pkl', 'rb') )
 
 def get_vocab( smi ):
-    m = get_geom_rdkit( smi ) #type(output) = mol
+    m = get_geom_rdkit( smi , mode ='precise') #type(output) = mol
     if m is None:
+        print(f'!!!!!!!!!!! Failed case for get_vocab {smi} {m}')
         return None
     dist_mat = Chem.Get3DDistanceMatrix(m)
     vocab_list = []
@@ -24,16 +25,58 @@ def get_vocab( smi ):
         vocab_list.append(vocab_key)
     return vocab_list
 
-def get_geom_rdkit( smi , max_try=10):
+def get_geom_rdkit( smi , max_try=10, mode='normal'):
     mol = Chem.AddHs( Chem.MolFromSmiles(smi) )
     if mol is None:
         return None
     num_try= 0
     while num_try < max_try:
         try:
-            AllChem.EmbedMolecule( mol ) 
-            AllChem.MMFFOptimizeMolecule( mol ) 
-            return mol
+            if mode == 'precise':
+#                print('precise mode')
+                mol = Chem.AddHs(mol)
+                params = AllChem.ETKDGv3()
+                params.useSmallRingTorsions = True
+                params.useExpTorsionAnglePrefs = True
+                params.useBasicKnowledge = True
+                params.pruneRmsThresh = 0.5
+                params.maxAttempts = 1000
+                params.randomSeed = 42
+            
+                conf_ids = AllChem.EmbedMultipleConfs(mol, numConfs=25, params=params)#max_confs=25
+                if not conf_ids:
+                    print('failed embedding')
+                    raise RuntimeError(f"Embedding failed for {smi}")
+                if not AllChem.MMFFHasAllMoleculeParams(mol):
+                    print('failed mmff94 params')
+                    raise RuntimeError(f"MMFF94s parameters unavailable for {smi}")
+            
+                props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s")
+                best_conf_id = None
+                min_energy = float('inf')
+                for cid in conf_ids:
+                    ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=cid)
+                    ff.Minimize(maxIts=2000)
+                    energy = ff.CalcEnergy()
+                    if energy < min_energy:
+                        min_energy = energy
+                        best_conf_id = cid
+            
+                if best_conf_id is None:
+                    print('failed search best conf id')
+                    raise RuntimeError(f"All conformers failed for {smi}")
+            
+                best_conf = mol.GetConformer(best_conf_id)
+                best_conf_cp = Chem.Conformer(best_conf)
+                mol.RemoveAllConformers()
+                mol.AddConformer(best_conf_cp, assignId=True)
+                return mol
+            else:
+#                print('normal model')
+                AllChem.EmbedMolecule( mol ) 
+                AllChem.MMFFOptimizeMolecule( mol )
+                return mol
+
         except Exception as e:
             num_try+=1
             continue
@@ -49,15 +92,11 @@ def get_dist( smi ):
     for bond in m.GetBonds():
         i,j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
         i_atom, j_atom = m.GetAtomWithIdx(i).GetSymbol(), m.GetAtomWithIdx(j).GetSymbol()
-#        print(i_atom, j_atom)
-#        print(atom_pair_index.get(f'{i_atom}-{j_atom}')
         dist = dist_mat[i,j]
         vocab_idx = atom_pair_index.get(f'{i_atom}-{j_atom}')
         vocab_list.append(vocab_idx)
         dist_list.append(dist)
-#    return torch.tensor(vocab_list, dtype=torch.long), torch.tensor(dist_list, dtype=torch.float)
     return torch.tensor(vocab_list).long(), torch.tensor(dist_list).float()
-#    return vocab_list
 
 def safe_get_dist(args):
     property_mean, property_std = pickle.load(open('./normalize.pkl', 'rb') )
@@ -73,45 +112,21 @@ def safe_get_dist(args):
 
 if __name__ == '__main__':
     import time
-    list_smi = [line.strip() for line in open('./data/1_Pretrain/1k_pretrain.txt')]
-    vocab_list=[]
-    for smi in tqdm(list_smi):
-        vocab_list  = get_vocab(smi)
-        try:
-            vocab_list.extend(vocab_list)
-        except Exception as e:
-            print(f'failed append vocab {smi}: {e}')
-    vocab = dict(Counter(vocab_list))
-    pickle.dump(vocab_dict, open(f'./50m_vocab.pkl', 'wb'))
-    exit(-1)
+    list_smi = [line.strip() for line in open('./data/1_Pretrain/pretrain_50m.txt')][1000000:1001000]
     st = time.time()
     with Pool(24) as p:
-        #results = list(tqdm(p.imap(get_vocab, enumerate(list_smi)), total=len(list_smi)))
-        results = list(tqdm(p.map(get_vocab, enumerate(list_smi)), total=len(list_smi)))
-    list_tmp_vocab = [item for item in results if None not in item]
-    print('filtering \n\n', list_tmp_vocab)
+        results = list(tqdm(p.map(get_vocab, enumerate(list_smi) ), total=len(list_smi)))
+#        results = list(tqdm(p.imap(get_vocab, list_smi), total=len(list_smi)))
+#        results = list(tqdm(p.imap_unordered(get_vocab, list_smi, chunksize=10), total=len(list_smi)))
+    print('end of get_vocab')
     et = time.time()
+    results = [item for item in results if item is not None]
+    print(f'Time for get geo:  {et-st:.2f}, {len(results)}')
+    exit(-1)
+    list_tmp_vocab = [item for item in results if None not in item]
     vocab_dict = Counter(list_tmp_vocab)
     print(vocab_dict)
-    exit(-1)
 
-#        results = data_preprocess(smi)
-#        prop, smi, atom_pair, dist = results[0], results[1], results[2], results[3]
-#        if prop is None:
-#            prop_idx+=1
-#        if smi_idx is None:
-#            smi_idx+=1
-#        if atom_idx is None:
-#            atom_idx+=1
-#        if dist_idx is None:
-#            dist_idx+=1
-#    print(prop_idx, smi_idx, atom_idx, dist_idx)
-
-#        if data_preprocess(smi) is not None:
-#            idx+=1
-#            print(f'{idx}/{len(list_smi)}')
-#    print(idx)
-    exit(-1)
     #for line in output:
         #print(line)
     df = pd.DataFrame(output, columns=['atom_pair', 'dist'])
