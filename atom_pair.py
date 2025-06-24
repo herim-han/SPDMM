@@ -11,6 +11,19 @@ from multiprocessing import Pool
 
 atom_pair_index = pickle.load(open('atom_pair_vocab.pkl', 'rb') )
 
+def get_vocab( smi ):
+    m = get_geom_rdkit( smi ) #type(output) = mol
+    if m is None:
+        return None
+    dist_mat = Chem.Get3DDistanceMatrix(m)
+    vocab_list = []
+    for bond in m.GetBonds():
+        i,j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        i_atom, j_atom = m.GetAtomWithIdx(i).GetSymbol(), m.GetAtomWithIdx(j).GetSymbol()
+        vocab_key = f'{i_atom}-{j_atom}'
+        vocab_list.append(vocab_key)
+    return vocab_list
+
 def get_geom_rdkit( smi , max_try=10):
     mol = Chem.AddHs( Chem.MolFromSmiles(smi) )
     if mol is None:
@@ -61,42 +74,25 @@ def safe_get_dist(args):
 if __name__ == '__main__':
     import time
     list_smi = [line.strip() for line in open('./data/1_Pretrain/1k_pretrain.txt')]
+    vocab_list=[]
+    for smi in tqdm(list_smi):
+        vocab_list  = get_vocab(smi)
+        try:
+            vocab_list.extend(vocab_list)
+        except Exception as e:
+            print(f'failed append vocab {smi}: {e}')
+    vocab = dict(Counter(vocab_list))
+    pickle.dump(vocab_dict, open(f'./50m_vocab.pkl', 'wb'))
+    exit(-1)
     st = time.time()
     with Pool(24) as p:
-        results = list(tqdm(p.imap(safe_get_dist, enumerate(list_smi)), total=len(list_smi)))
-    print('results!!!', len(results))
-    #list_tmp = [item for row in results for item in row if None not in row]
-    list_tmp = [item for item in results if None not in item]
-    print('filtering \n\n', list_tmp)
+        #results = list(tqdm(p.imap(get_vocab, enumerate(list_smi)), total=len(list_smi)))
+        results = list(tqdm(p.map(get_vocab, enumerate(list_smi)), total=len(list_smi)))
+    list_tmp_vocab = [item for item in results if None not in item]
+    print('filtering \n\n', list_tmp_vocab)
     et = time.time()
-    print(f'{len(list_tmp)} time: {et-st}')
-    exit(-1)
-#    output = [get_dist(smi) for smi in list_smi]
-    error_idx =0
-    for idx, smi in enumerate(tqdm(list_smi) ):
-        try:
-            atom_symbol, dist = get_dist(smi)
-            #print(atom_symbol, dist)
-        except Exception as e:
-            error_idx +=1
-            print(f'Faild {idx}: {e}')
-    print(error_idx)
-    exit(-1)
-    results= []
-    error=0
-    for idx, smi in enumerate(tqdm(list_smi)):
-        try:
-            print(f'{idx}/{len(list_smi)}')
-            atom_pair, dist = get_dist(smi)
-        except:
-            error+=1
-            continue
-    print(results)
-    print(error)
-    vocab_dict = Counter(results)
+    vocab_dict = Counter(list_tmp_vocab)
     print(vocab_dict)
-    results= set(results)
-    print(results)
     exit(-1)
 
 #        results = data_preprocess(smi)
@@ -116,9 +112,6 @@ if __name__ == '__main__':
 #            print(f'{idx}/{len(list_smi)}')
 #    print(idx)
     exit(-1)
-    uniq_atom_set = set(sum(output, []))
-    print(len(uniq_atom_set), uniq_atom_set)
-    exit(-1)
     #for line in output:
         #print(line)
     df = pd.DataFrame(output, columns=['atom_pair', 'dist'])
@@ -131,4 +124,3 @@ if __name__ == '__main__':
     df['idx'] = vocab_idx
     print(df)
     exit(-1)
-    

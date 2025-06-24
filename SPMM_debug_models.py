@@ -135,6 +135,10 @@ class SPMM(pl.LightningModule):
         with torch.no_grad():
             self.temp.clamp_(0.01, 0.5) #all elements in range (min, max)
         #(B,len)>(B,len,embed_dim)
+#        print('text encoder', self.text_encoder)
+#        print('prop encoder', self.prop_encoder)
+#        print('dist encoder', self.dist_encoder)
+#        exit(-1)
         property_feature = self.prop_embed(property_original.clone().detach().unsqueeze(2))
         unk_tokens = self.prop_mask.expand(property_original.size(0), property_original.size(1), -1)
         prop_mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5) #(B, len)
@@ -233,7 +237,7 @@ class SPMM(pl.LightningModule):
         loss_mlm = {}
         for key in ['prop', 'dist']:
             conditional = (results[key]['embeds'], results[key]['atts'], results_m[key]['m_embeds'])
-            loss_mlm[f'{key}2text'] = self.mlm_prediction(text_features, conditional, alpha)
+            loss_mlm[key] = self.mlm_prediction(text_features, conditional, alpha)
 
         # ================= MPM ================= #
         text_features = (results['text']['embeds'], results['text']['atts'])
@@ -244,7 +248,9 @@ class SPMM(pl.LightningModule):
                                                 prop_features,
                                                 model_config[key]["model"], 
                                                 model_config[key]["mtr_head"])
-        #dictionary type for loss_mlm, loss_mpm, loss_itm 
+        with open("debug_log.txt", "a") as f:
+            f.write(f"{loss_mpm}\n")
+
         return sum(loss_mlm.values()), sum(loss_mpm.values()) * 5, loss_ita, sum(loss_itm.values())
 
     @torch.no_grad()
@@ -310,10 +316,10 @@ class SPMM(pl.LightningModule):
         #loss_mlm, loss_mpm, loss_ita, loss_itm = self(prop, text_input.input_ids[:, 1:], text_input.attention_mask[:, 1:], alpha=alpha)
         # w/ line 288 tokenization_bert.py // return tokens + [SEP]
         loss_mlm, loss_mpm, loss_ita, loss_itm = self(prop, text_input.input_ids, text_input.attention_mask, atom_pair, dist, alpha=alpha)
-        print('loss_mlm', loss_mlm)
-        print('loss_mpm', loss_mpm)
-        print('loss_ita', loss_ita)
-        print('loss_itm', loss_itm)
+#        print('loss_mlm', loss_mlm)
+#        print('loss_mpm', loss_mpm)
+#        print('loss_ita', loss_ita)
+#        print('loss_itm', loss_itm)
 
         loss = loss_mlm + loss_mpm + loss_ita + loss_itm
         if loss != torch.tensor(0.):
@@ -392,7 +398,7 @@ class SPMM(pl.LightningModule):
     def mlm_prediction(self, text_feature, conditional, alpha):
         input_ids, labels, text_attention_mask = text_feature
         prop_embeds, prop_atts, prop_embeds_m = conditional
-        # ================= MLM: Masked Language Modeling + teacher distillation ================= #
+        # ================= MLM: Masked Language Modeling + teacher distillation ================= # (Next Word Prediction)
         # Auto-regressive text prediction
 
         with torch.no_grad():

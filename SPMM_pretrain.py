@@ -64,7 +64,7 @@ def main(args, config):
     checkpoint_callback = pl.callbacks.ModelCheckpoint(dirpath=args.output_dir, filename='checkpoint_{epoch}',
                                                        every_n_train_steps=10000,
                                                        )
-    trainer = pl.Trainer(accelerator='gpu', devices=2, precision='16-mixed', max_epochs=config['schedular']['epochs'],
+    trainer = pl.Trainer(accelerator='gpu', devices=args.gpus, precision='16-mixed', max_epochs=config['schedular']['epochs'],
                          callbacks=[checkpoint_callback], strategy=DDPStrategy(find_unused_parameters=True), limit_val_batches=0.)
 #    trainer = pl.Trainer(accelerator=args.accelerator, 
 #                         devices=args.gpus, 

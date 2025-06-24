@@ -1,4 +1,4 @@
-# Structure-Property-Distance Multi-Modal learning for molecules
+# Structure-Property-Distance Multi-Modal Foundation Model
 
-integrated atom-pair and distance value
-
+integrated structural context for the bonded atoms-pair and distance
+updated up to the training (Text-Prop-Dist)
