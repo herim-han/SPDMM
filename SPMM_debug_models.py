@@ -22,7 +22,8 @@ def create_unimodal_models(config, hidden_width, embed_dim, norm_eps, is_momentu
         mtr_head = nn.Sequential(nn.Linear(hidden_width, hidden_width),
                                                    nn.GELU(),
                                                    nn.LayerNorm(hidden_width, norm_eps),
-                                                   nn.Linear(hidden_width, 1))
+                                                   nn.Linear(hidden_width, 1),
+                                                   nn.Softplus())
         cls_token   = nn.Parameter(torch.zeros(1,1, hidden_width))
         mask_token  = nn.Parameter(torch.zeros(1,1, hidden_width))
         return encoder, mtr_head, cls_token, mask_token, proj_layer
@@ -241,17 +242,16 @@ class SPMM(pl.LightningModule):
 
         # ================= MPM ================= #
         text_features = (results['text']['embeds'], results['text']['atts'])
-        loss_mpm = {}
+        loss_mvm = {}
         for (key, mask, targets) in [('prop', prop_mpm_mask, property_original.clone()), ('dist', dist_mpm_mask, dist.clone())]:
             prop_features = (dynamic_inputs[key]["inputs_embeds"], results[key]['atts'], mask, targets)
-            loss_mpm[key] = self.mpm_prediction(text_features, 
+            loss_mvm[key] = self.mpm_prediction(text_features, 
                                                 prop_features,
                                                 model_config[key]["model"], 
                                                 model_config[key]["mtr_head"])
-        with open("debug_log.txt", "a") as f:
-            f.write(f"{loss_mpm}\n")
-
-        return sum(loss_mlm.values()), sum(loss_mpm.values()) * 5, loss_ita, sum(loss_itm.values())
+        loss_prop = loss_mvm['prop']
+        loss_dist = loss_mvm['dist']
+        return sum(loss_mlm.values()), loss_prop * 5, loss_dist*10, loss_ita, sum(loss_itm.values())
 
     @torch.no_grad()
     def copy_params(self):

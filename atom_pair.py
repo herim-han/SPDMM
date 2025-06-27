@@ -94,6 +94,7 @@ def get_dist( smi ):
         i_atom, j_atom = m.GetAtomWithIdx(i).GetSymbol(), m.GetAtomWithIdx(j).GetSymbol()
         dist = dist_mat[i,j]
         vocab_idx = atom_pair_index.get(f'{i_atom}-{j_atom}')
+        #vocab_idx = atom_pair_index.get(f'{i_atom}-{j_atom}', atom_pair_index['[UNK]']) #assign UNK when the atom-pair excluded in vocab
         vocab_list.append(vocab_idx)
         dist_list.append(dist)
     return torch.tensor(vocab_list).long(), torch.tensor(dist_list).float()
