@@ -102,8 +102,8 @@ if __name__ == '__main__':
 
 
     pretrain_config = {
-        'property_width': 768,#768
-        'embed_dim': 124,
+        'property_width': 256,#768
+        'embed_dim': 128,
         'batch_size': 24,
         #'batch_size': 96,
         'temp': 0.07,

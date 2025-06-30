@@ -13,7 +13,6 @@ import pickle
 
 def create_unimodal_models(config, hidden_width, embed_dim, norm_eps, is_momentum=False):
     encoder = BertForMaskedLM(config=config)
-    print('hidden&embed', hidden_width, embed_dim)
     proj_layer = nn.Linear(hidden_width, embed_dim)
     if is_momentum:
         for p in encoder.parameters():      p.requires_grad = False
@@ -163,7 +162,6 @@ class SPMM(pl.LightningModule):
         model_config = self.build_config(**self.static_config, **dynamic_inputs)
         results= {}
         for modal in model_config.keys():      # modal: prop, text, dist
-            print(f'!!!!!!!!!!!! {modal}')
             e_model = model_config[modal]["model"].bert if modal == 'text' else model_config[modal]["model"]
             embeds, feat, _ = extract_feature(
                 e_model, model_config[modal]["proj"], model_config[modal]["queue"], model_config[modal]["inputs"], model_config[modal]["is_momentum"]
@@ -183,7 +181,7 @@ class SPMM(pl.LightningModule):
         results_m = {}
         for modal in  model_m_config.keys():      # modality: prop, text, dist
             m_encoder = model_m_config[modal]["model"].bert if modal == 'text' else model_m_config[modal]["model"]
-            print(model_config[modal]['queue'].shape)
+            #print(model_config[modal]['queue'].shape)
             m_embeds, m_feat, feat_all = extract_feature(
                 m_encoder, model_m_config[modal]["proj"], model_config[modal]["queue"], model_config[modal]["inputs"], is_momentum=True
             )
