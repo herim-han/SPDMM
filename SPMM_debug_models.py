@@ -135,11 +135,7 @@ class SPMM(pl.LightningModule):
             self.set_eval_mode()
         with torch.no_grad():
             self.temp.clamp_(0.01, 0.5) #all elements in range (min, max)
-        #(B,len)>(B,len,embed_dim)
-#        print('text encoder', self.text_encoder)
-#        print('prop encoder', self.prop_encoder)
-#        print('dist encoder', self.dist_encoder)
-#        exit(-1)
+
         property_feature = self.prop_embed(property_original.clone().detach().unsqueeze(2))
         unk_tokens = self.prop_mask.expand(property_original.size(0), property_original.size(1), -1)
         prop_mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5) #(B, len)
@@ -249,9 +245,9 @@ class SPMM(pl.LightningModule):
                                                 prop_features,
                                                 model_config[key]["model"], 
                                                 model_config[key]["mtr_head"])
-        loss_prop = loss_mvm['prop']
-        loss_dist = loss_mvm['dist']
-        return sum(loss_mlm.values()), loss_prop * 5, loss_dist*10, loss_ita, sum(loss_itm.values())
+        loss_mpm = loss_mvm['prop']
+        loss_mdm = loss_mvm['dist']
+        return sum(loss_mlm.values()), loss_mpm* 5, loss_mdm*10, loss_ita, sum(loss_itm.values())
 
     @torch.no_grad()
     def copy_params(self):
@@ -315,13 +311,9 @@ class SPMM(pl.LightningModule):
         # w/ line 289 tokenization_bert.py // return [CLS] + tokens + [SEP]
         #loss_mlm, loss_mpm, loss_ita, loss_itm = self(prop, text_input.input_ids[:, 1:], text_input.attention_mask[:, 1:], alpha=alpha)
         # w/ line 288 tokenization_bert.py // return tokens + [SEP]
-        loss_mlm, loss_mpm, loss_ita, loss_itm = self(prop, text_input.input_ids, text_input.attention_mask, atom_pair, dist, alpha=alpha)
-#        print('loss_mlm', loss_mlm)
-#        print('loss_mpm', loss_mpm)
-#        print('loss_ita', loss_ita)
-#        print('loss_itm', loss_itm)
+        loss_mlm, loss_mpm,loss_mdm, loss_ita, loss_itm = self(prop, text_input.input_ids, text_input.attention_mask, atom_pair, dist, alpha=alpha)
 
-        loss = loss_mlm + loss_mpm + loss_ita + loss_itm
+        loss = loss_mlm + loss_mpm +loss_mdm+ loss_ita + loss_itm
         if loss != torch.tensor(0.):
             self.manual_backward(loss)
             torch.nn.utils.clip_grad_norm_(self.parameters(), 5.)
@@ -332,6 +324,7 @@ class SPMM(pl.LightningModule):
             self.log('lr', optimizer.param_groups[0]["lr"], prog_bar=True)
             self.log('loss_mlm', loss_mlm, prog_bar=True)
             self.log('loss_mpm', loss_mpm, prog_bar=True)
+            self.log('loss_mdm', loss_mpm, prog_bar=True)
             self.log('loss_ita', loss_ita, prog_bar=True)
             self.log('loss_itm', loss_itm, prog_bar=True)
 
@@ -656,7 +649,8 @@ class Embed3DStruct(torch.nn.Module):
         super().__init__()
         self.pair_embed_length = symbol_pair_embed_length + distance_embed_length
         self.dist_embed = DistEmbedLayer(distance_embed_length, 0.0, 6.0)
-        self.pair_symbol_embed = nn.Embedding( 60 , symbol_pair_embed_length ) #(vocab_size, embed_length)
+        self.vocab_size = pickle.load(open('new_atom_pair_vocab.pkl', 'rb'))
+        self.pair_symbol_embed = nn.Embedding( len(self.vocab_size), symbol_pair_embed_length ) #(vocab_size, embed_length)
         #self.cls_token = nn.Parameter(torch.zeros(1, 1, self.pair_embed_length))
 
     def forward(self, pair_symbols, distances):

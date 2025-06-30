@@ -5,9 +5,11 @@ import torch.distributed
 import argparse
 from pathlib import Path
 from transformers import BertTokenizer, WordpieceTokenizer
+from pytorch_lightning import loggers as pl_loggers
+from pytorch_lightning.loggers import CSVLogger
 import time
 import pickle
-
+torch.set_float32_matmul_precision('medium')
 def main(args, config):
     #CUDA_LAUNCH_BLOCKING=1
     #ngpu=1
@@ -53,24 +55,31 @@ def main(args, config):
         print('time for dataset', et-st)
         print('#data:', len(dataset), torch.cuda.is_available())
         print('turn off debugging')
+
         data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=0, shuffle=False, pin_memory=True, drop_last=True)
         model = SPMM(config=config, tokenizer=tokenizer, loader_len=len(data_loader) // torch.cuda.device_count())
 
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location='cpu')
         _ = model.load_state_dict(checkpoint['state_dict'], strict=False)
-
+#    tb_logger = pl_loggers.TensorBoardLogger(save_dir='lightning_csv_logs', name=f'spmm-bs-{config["batch_size"]}-ddim-{config["embed_dim"]}')
+    csv_logger = CSVLogger('lightning_csv_logs', name=f'spmm-bs-{config["batch_size"]}-ddim-{config["embed_dim"]}')
     # training
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(dirpath=args.output_dir, filename='checkpoint_{epoch}',
-                                                       every_n_train_steps=10000,
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(dirpath=args.output_dir, 
+                                                       filename='checkpoint_{epoch}',
+#                                                       every_n_train_steps=10000,
+                                                       every_n_train_steps=1,
                                                        )
-    trainer = pl.Trainer(accelerator='gpu', devices=args.gpus, precision='16-mixed', max_epochs=config['schedular']['epochs'],
-                         callbacks=[checkpoint_callback], strategy=DDPStrategy(find_unused_parameters=True), limit_val_batches=0.)
-#    trainer = pl.Trainer(accelerator=args.accelerator, 
-#                         devices=args.gpus, 
-#                         max_epochs=config['schedular']['epochs'],
-#                         callbacks=[checkpoint_callback], 
-#                         strategy=args.strategy, )
+    trainer = pl.Trainer(accelerator='gpu', 
+                         devices=args.gpus, 
+                         precision='16-mixed', 
+                         max_epochs=config['schedular']['epochs'],
+                         callbacks=[checkpoint_callback], 
+                         strategy=DDPStrategy(find_unused_parameters=True), 
+                         limit_val_batches=0.,
+#                         logger=True
+                         )
+    trainer.logger = csv_logger
     trainer.fit(model, data_loader, None, ckpt_path=args.checkpoint if args.checkpoint else None)
 
 
