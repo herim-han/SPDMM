@@ -25,7 +25,7 @@ def get_vocab( smi ):
         vocab_list.append(vocab_key)
     return vocab_list
 
-def get_geom_rdkit( smi , max_try=10, mode='normal'):
+def get_geom_rdkit( smi , max_try=5, mode='normal'):
     mol = Chem.AddHs( Chem.MolFromSmiles(smi) )
     if mol is None:
         return None
