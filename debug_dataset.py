@@ -1,309 +1,125 @@
 from torch.utils.data import Dataset
-import torch
 import random
-import pandas as pd
 from rdkit import Chem
-import pickle
 from rdkit import RDLogger
-from calc_property import calculate_property
-from pysmilesutils.augment import MolAugmenter
-from atom_pair import get_dist
-import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
-from multiprocessing import Pool
+import numpy as np
+import rdkit
+from rdkit import Chem
+from rdkit.Chem import AllChem, Descriptors
+import torch
+import pandas as pd
+import pickle
+from collections import Counter, OrderedDict
 from tqdm import tqdm
+import multiprocessing
+from multiprocessing import Pool
 RDLogger.DisableLog('rdApp.*')
 torch.multiprocessing.set_sharing_strategy('file_system')
+multiprocessing.set_start_method("spawn", force=True)
 
-class SMILESDataset_pretrain(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        self.smiles = [l.strip() for l in open(data_path).readlines()]
+with open('./property_name.txt', 'r') as f:
+    names = [n.strip() for n in f.readlines()][:53]
 
-        with Pool(24) as p:
-            results = list(tqdm(p.imap(data_preprocess, enumerate(self.smiles) ), total=len(self.smiles)) )
-#        self.data = [item for item in results if None not in item]
-        self.data = [item for item in results if all(x is not None for x in item)]
+descriptor_dict = OrderedDict()
+for n in names:
+    if n == 'QED':
+        descriptor_dict[n] = lambda x: Chem.QED.qed(x)
+    else:
+        descriptor_dict[n] = getattr(Descriptors, n)
 
-        if shuffle:
-            random.shuffle(self.data)
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        return self.data[index]
+atom_pair_index = pickle.load(open('new_atom_pair_vocab.pkl', 'rb') )
+property_mean, property_std = pickle.load(open('./normalize.pkl', 'rb') )
+property_mean = property_mean.detach().cpu().numpy().astype(np.float32)
+property_std  = property_std.detach().cpu().numpy().astype(np.float32)
 
 def data_preprocess(args):
     idx, smiles = args
-    property_mean, property_std = pickle.load(open('./normalize.pkl', 'rb') )
     try:
         smiles = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), isomericSmiles=False, canonical=True)
-        properties = (calculate_property(smiles) - property_mean) / property_std
+        prop = calculate_property(smiles)
+        properties = (prop - property_mean) / property_std #numpy, numpy, numpy
         atom_set, dist = get_dist(smiles) or (None, None)
-        return properties, '[CLS]' + smiles, atom_set, dist
-
+#        print('55555', type(atom_set), type(dist))
+        atom_set = to_numpy(atom_set)
+        dist = to_numpy(dist)
+        return properties, smiles, atom_set, dist
     except Exception as e:
-        print(f"Failed processing {idx} {smiles}: {e}")
+        print(f"Failed processing {idx}: {e}")
         return None
+        
+def calculate_property(smiles):
+    RDLogger.DisableLog('rdApp.*')
+    mol = Chem.MolFromSmiles(smiles)
+    output = []
+    for i, descriptor in enumerate(descriptor_dict):
+        # print(descriptor)
+        output.append(descriptor_dict[descriptor](mol))
+#    return torch.tensor(output, dtype=torch.float)
+    return output
+
+def to_numpy(x):
+    if x is None:
+        return None
+    elif isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy().astype(np.float32)
+    return x
+
+def get_dist( smi ):
+    m = get_geom_rdkit( smi ) #type(output) = mol
+    if m is None:
+        return None
+    dist_mat = Chem.Get3DDistanceMatrix(m)
+    vocab_list = []
+    dist_list  = []
+    for bond in m.GetBonds():
+        i,j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        i_atom, j_atom = m.GetAtomWithIdx(i).GetSymbol(), m.GetAtomWithIdx(j).GetSymbol()
+        dist = dist_mat[i,j]
+        vocab_idx = atom_pair_index.get(f'{i_atom}-{j_atom}', atom_pair_index['[UNK]']) #assign UNK when the atom-pair excluded in vocab
+        vocab_list.append(vocab_idx)
+        dist_list.append(dist)
+    #return torch.tensor(vocab_list).long(), torch.tensor(dist_list).float()
+    return vocab_list, dist_list
             
-def collate_fn(batch):
-    properties, smiles, atom_pair, dist = zip(*batch)
-    properties = torch.stack(properties)
-    atom_pair = pad_sequence(atom_pair, batch_first=True, padding_value=0)
-    dist = pad_sequence(dist, batch_first=True, padding_value=0)
-    return properties, smiles, atom_pair, dist
-
-class SMILESDataset_BACEC(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        data = pd.read_csv(data_path)
-        self.data = [data.iloc[i] for i in range(len(data))]
-
-        if shuffle: random.shuffle(self.data)
-        if data_length is not None: self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]['mol']), isomericSmiles=False, canonical=True)
-        value = int(self.data[index]['Class'])
-
-        return '[CLS]' + smiles, value
-
-
-class SMILESDataset_BACER(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        data = pd.read_csv(data_path)
-        self.data = [data.iloc[i] for i in range(len(data))]
-
-        self.value_mean = torch.tensor(6.420878294545455)
-        self.value_std = torch.tensor(1.345219669175284)
-
-        if shuffle: random.shuffle(self.data)
-        if data_length is not None: self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]['smiles']), isomericSmiles=False)
-        value = torch.tensor(self.data[index]['target'].item())
-        return '[CLS]' + smiles, value
-
-
-class SMILESDataset_LIPO(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        data = pd.read_csv(data_path)
-        self.data = [data.iloc[i] for i in range(len(data))]
-
-        self.value_mean = torch.tensor(2.162904761904762)
-        self.value_std = torch.tensor(1.210992810122257)
-
-        if shuffle: random.shuffle(self.data)
-        if data_length is not None: self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        mol = Chem.MolFromSmiles(self.data[index]['smiles'])
-        smiles = Chem.MolToSmiles(mol, isomericSmiles=False, canonical=True)
-        value = torch.tensor(self.data[index]['exp'].item())
-
-        return '[CLS]' + smiles, value
-
-
-class SMILESDataset_Clearance(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        data = pd.read_csv(data_path)
-        self.data = [data.iloc[i] for i in range(len(data))]
-
-        self.value_mean = torch.tensor(51.503692077727955)
-        self.value_std = torch.tensor(53.50834365711207)
-
-        if shuffle: random.shuffle(self.data)
-        if data_length is not None: self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        mol = Chem.MolFromSmiles(self.data[index]['smiles'])
-        smiles = Chem.MolToSmiles(mol, isomericSmiles=False, canonical=True)
-        value = torch.tensor(self.data[index]['target'].item())
-
-        return '[CLS]' + smiles, value
-
-
-class SMILESDataset_BBBP(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        data = pd.read_csv(data_path)
-        self.data = [data.iloc[i] for i in range(len(data)) if Chem.MolFromSmiles(data.iloc[i]['smiles'])]
-
-        if shuffle: random.shuffle(self.data)
-        if data_length is not None: self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]['smiles']), isomericSmiles=False)
-        label = int(self.data[index]['p_np'])
-
-        return '[CLS]' + smiles, label
-
-
-class SMILESDataset_ESOL(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        data = pd.read_csv(data_path)
-        self.data = [data.iloc[i] for i in range(len(data))]
-
-        self.value_mean = torch.tensor(-2.8668758314855878)
-        self.value_std = torch.tensor(2.066724108076815)
-
-        if shuffle: random.shuffle(self.data)
-        if data_length is not None: self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        mol = Chem.MolFromSmiles(self.data[index]['smiles'])
-        smiles = Chem.MolToSmiles(mol, isomericSmiles=False, canonical=True)
-        value = torch.tensor(self.data[index]['ESOL predicted log solubility in mols per litre'].item())
-
-        return '[CLS]' + smiles, value
-
-
-class SMILESDataset_Freesolv(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        data = pd.read_csv(data_path)
-        self.data = [data.iloc[i] for i in range(len(data))]
-
-        self.value_mean = torch.tensor(-3.2594736842105267)
-        self.value_std = torch.tensor(3.2775297233608893)
-
-        if shuffle: random.shuffle(self.data)
-        if data_length is not None: self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]['smiles']), isomericSmiles=False)
-        value = (self.data[index]['target'] - self.value_mean) / self.value_std
-
-        return '[CLS]' + smiles, value
-
-
-class SMILESDataset_Clintox(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        data = pd.read_csv(data_path)
-        self.data = [data.iloc[i] for i in range(len(data))]
-        self.n_output = 2
-
-        if shuffle: random.shuffle(self.data)
-        if data_length is not None: self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]['smiles']), isomericSmiles=False)
-        value = torch.tensor([float(self.data[index]['FDA_APPROVED']), float(self.data[index]['CT_TOX'])])
-
-        return '[CLS]' + smiles, value
-
-
-class SMILESDataset_SIDER(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        data = pd.read_csv(data_path)
-        self.data = [data.iloc[i] for i in range(len(data))]
-        self.n_output = 27
-
-        if shuffle: random.shuffle(self.data)
-        if data_length is not None: self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        smiles = Chem.MolToSmiles(Chem.MolFromSmiles(self.data[index]['smiles']), isomericSmiles=False, canonical=True, kekuleSmiles=False)
-        value = self.data[index].values.tolist()[1:]
-        value = torch.tensor([i.item() for i in value])
-        return '[CLS]' + smiles, value
-
-
-class SMILESDataset_DILI(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False):
-        data = pd.read_csv(data_path)
-        self.data = [data.iloc[i] for i in range(len(data))]
-
-        if shuffle: random.shuffle(self.data)
-        if data_length is not None: self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        mol = Chem.MolFromSmiles(self.data[index]['Smiles'])
-        smiles = Chem.MolToSmiles(mol, isomericSmiles=False, canonical=True)
-        value = torch.tensor(self.data[index]['Liver'].item())
-
-        return '[CLS]' + smiles, value
-
-
-class SMILESDataset_USPTO(Dataset):
-    def __init__(self, data_path, data_length=None, shuffle=False, aug=False):
-        self.is_aug = aug
-        self.aug = MolAugmenter()
-        with open(data_path, 'r') as f:
-            lines = f.readlines()
-        self.data = [line.strip() for line in lines]
-
-        if shuffle:
-            random.shuffle(self.data)
-        if data_length:
-            self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        rs, ps = self.data[index].split('\t')
-        if self.is_aug and random.random() > 0.5:
-            r_mol = self.aug([Chem.MolFromSmiles(rs[:])])[0]
-            rs = Chem.MolToSmiles(r_mol, canonical=False, isomericSmiles=False)
-            p_mol = self.aug([Chem.MolFromSmiles(ps[:])])[0]
-            ps = Chem.MolToSmiles(p_mol, canonical=False, isomericSmiles=False)
-        return '[CLS]' + rs, '[CLS]' + ps
-
-
-class SMILESDataset_USPTO_reverse(Dataset):
-    def __init__(self, data_length=None, shuffle=False, mode=None, aug=False):
-        with open('./data/6_RXNprediction/USPTO-50k/uspto_50.pickle', 'rb') as f:
-            data = pickle.load(f)
-        data = [data.iloc[i] for i in range(len(data))]
-        self.data = [d for d in data if d['set'] == mode]
-        self.is_aug = aug
-        self.aug = MolAugmenter()
-
-        if shuffle:
-            random.shuffle(self.data)
-        if data_length:
-            self.data = self.data[data_length[0]:data_length[1]]
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        d = self.data[index]
-        # r_type = d['reaction_type']
-        p_mol = d['products_mol']
-        r_mol = d['reactants_mol']
-        do_aug = self.is_aug and random.random() > 0.5
-        if do_aug:
-            p_mol = self.aug([p_mol])[0]
-            r_mol = self.aug([r_mol])[0]
-        return '[CLS]' + Chem.MolToSmiles(p_mol, canonical=not do_aug, isomericSmiles=False), \
-               '[CLS]' + Chem.MolToSmiles(r_mol, canonical=not do_aug, isomericSmiles=False)
+def get_geom_rdkit( smi , max_try=5, mode='normal'):
+    mol = Chem.AddHs( Chem.MolFromSmiles(smi) )
+    if mol is None:
+        return None
+    num_try= 0
+    while num_try < max_try:
+        try:
+#            print('normal model')
+            AllChem.EmbedMolecule( mol ) 
+            AllChem.MMFFOptimizeMolecule( mol )
+            return mol
+
+        except Exception as e:
+            num_try+=1
+            continue
+    print(f'Failed to get geo max_try {max_try}: {smi}')
+
+if __name__=='__main__':
+    import os
+    import time
+#    list_smiles = [l.strip() for l in open('./data/1_Pretrain/pretrain_50m.txt').readlines()][:10000]
+    list_name = sorted(os.listdir('./pubchem_chunk'))[10:15]
+    print(list_name)
+    
+    for name in list_name:
+        print(name)
+        list_smiles = [line.strip() for line in open(f'./pubchem_chunk/{name}').readlines()]
+        st = time.time()
+        try:
+            with Pool(24) as p:
+        #        results = list(tqdm(p.map(data_preprocess, enumerate(list_smiles) ), total=len(list_smiles)) )
+        #        results = list(tqdm(p.imap(data_preprocess, enumerate(list_smiles) ), total=len(list_smiles)) )
+                results = list(tqdm(p.imap_unordered(data_preprocess, enumerate(list_smiles), chunksize=1), total=len(list_smiles)))
+            et = time.time()
+            print(f'Time for {name} file: {et-st:.3f} ')
+            filtered_results = [item for item in results
+                                if item is not None and all(x is not None for x in item) ]
+        #    with open('map_SMILESDataset.pkl', 'wb') as f:
+            with open(f'./Dataset/{name}_SMILESDataset.pkl', 'wb') as f:
+                pickle.dump(filtered_results, f)
+        except Exception as e:
+            print(f'Error occur : {name}, {e}')

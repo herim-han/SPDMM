@@ -44,12 +44,10 @@ def main(args, config):
         from dataset import SMILESDataset_pretrain
         st = time.time()
         if (args.pkl is None):
-            print('111111 start dataset')
             dataset = SMILESDataset_pretrain(args.data_path)
             with open('SMILESDataset.pkl', 'wb') as f:
                 pickle.dump(dataset, f)
         else:
-            print('222222222222222')
             dataset = pickle.load(open(args.pkl, 'rb'))
         et = time.time()
         print('time for dataset', et-st)
