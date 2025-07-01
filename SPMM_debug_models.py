@@ -301,6 +301,8 @@ class SPMM(pl.LightningModule):
         scheduler = self.lr_schedulers()
         optimizer.zero_grad()
         prop, text, atom_pair, dist = train_batch #tensor (B, 53), list (B), list (B)
+#        print('step for training', type(prop), type(text), type(atom_pair), type(dist))
+        print('device', prop.device, atom_pair.device, dist.device)
         # self.tokenizer = BertTokenizer from transformers
         # text_input contained two [CLS] token
         text_input = self.tokenizer(text, padding='longest', truncation=True, max_length=100, return_tensors="pt").to(prop.device)

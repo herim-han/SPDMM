@@ -22,7 +22,7 @@ def main(args, config):
 
     if args.debugging:
         from SPMM_debug_models import SPMM
-        from debug_dataset import SMILESDataset_pretrain, collate_fn
+        from dataset import SMILESDataset_pretrain, collate_fn
         st = time.time()
         if (args.pkl is None):
             print('111111 start dataset')
@@ -41,7 +41,7 @@ def main(args, config):
     else:
 #        from SPMM_models import SPMM
         from bk_SPMM_models import SPMM
-        from dataset import SMILESDataset_pretrain
+        from bk_dataset import SMILESDataset_pretrain
         st = time.time()
         if (args.pkl is None):
             dataset = SMILESDataset_pretrain(args.data_path)
