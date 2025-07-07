@@ -102,7 +102,7 @@ if __name__=='__main__':
     import os
     import time
 #    list_smiles = [l.strip() for l in open('./data/1_Pretrain/pretrain_50m.txt').readlines()][:10000]
-    list_name = sorted(os.listdir('./pubchem_chunk'))[10:15]
+    list_name = sorted(os.listdir('./pubchem_chunk'))[:3]
     print(list_name)
     
     for name in list_name:

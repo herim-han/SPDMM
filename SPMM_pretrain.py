@@ -9,53 +9,68 @@ from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.loggers import CSVLogger
 import time
 import pickle
+import numpy as np
+import os
+from tqdm import tqdm
+import multiprocessing
+from multiprocessing import Pool
+import mmap
+import joblib
+from joblib import Parallel, delayed
+from dataset import SMILESDataset_pretrain, collate_fn
+from SPMM_debug_models import SPMM
 torch.set_float32_matmul_precision('medium')
+
 def main(args, config):
     #CUDA_LAUNCH_BLOCKING=1
     #ngpu=1
-    # data
     print("Creating dataset")
-    #dataset = SMILESDataset_pretrain(args.data_path, data_length=[0, 50000000])
 
     tokenizer = BertTokenizer(vocab_file=args.vocab_filename, do_lower_case=False, do_basic_tokenize=False, add_special_tokens=False)
     tokenizer.wordpiece_tokenizer = WordpieceTokenizer(vocab=tokenizer.vocab, unk_token=tokenizer.unk_token, max_input_chars_per_word=250)
+    if (args.pkl is None):
+        st = time.time()
+        file_names = os.listdir('./Dataset')[:2]
+        tmp_dataset = []
+        for name in file_names:
+            print(f'Start load {name}')
+            tmp_st = time.time()
+            data = pickle.load(open(f'./Dataset/{name}', 'rb'))
+            tmp_et = time.time()
+            print(f'End load {name}, {tmp_et-tmp_st:.3f}')
+            tmp_dataset.append(data) 
+        all_dataset = torch.utils.data.ConcatDataset(tmp_dataset)
+        data_loader = DataLoader(all_dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)#num_workers = IterableDataset
+        et = time.time()
+        print(f'time for dataloading: {et-st:.3f}, # dataset: {len(all_dataset)}')
+    else:#
+#        dataset = SMILESDataset_pretrain(args.data_path)
+        all_dataset = pickle.load(open(args.pkl, 'rb'))
+        data_loader = DataLoader(all_dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
 
     if args.debugging:
-        from SPMM_debug_models import SPMM
-        from dataset import SMILESDataset_pretrain, collate_fn
-        st = time.time()
-        if (args.pkl is None):
-            print('111111 start dataset')
-            dataset = SMILESDataset_pretrain(args.data_path)
-            with open('SMILESDataset.pkl', 'wb') as f:
-                pickle.dump(dataset, f)
-        else:
-            print('222222222222222')
-            dataset = pickle.load(open(args.pkl, 'rb'))
-        et = time.time()
-        print('time for dataset', et-st)
-        print('#data:', len(dataset), torch.cuda.is_available())
-        print('turn on debugging')
-        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=8, shuffle=False, pin_memory=True, drop_last=True, collate_fn=collate_fn)
-        model = SPMM(config=config, tokenizer=tokenizer, loader_len=len(data_loader) // torch.cuda.device_count(), debugging=args.debugging)
-    else:
-#        from SPMM_models import SPMM
-        from bk_SPMM_models import SPMM
-        from bk_dataset import SMILESDataset_pretrain
-        st = time.time()
-        if (args.pkl is None):
-            dataset = SMILESDataset_pretrain(args.data_path)
-            with open('SMILESDataset.pkl', 'wb') as f:
-                pickle.dump(dataset, f)
-        else:
-            dataset = pickle.load(open(args.pkl, 'rb'))
-        et = time.time()
-        print('time for dataset', et-st)
-        print('#data:', len(dataset), torch.cuda.is_available())
-        print('turn off debugging')
-
-        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=0, shuffle=False, pin_memory=True, drop_last=True)
-        model = SPMM(config=config, tokenizer=tokenizer, loader_len=len(data_loader) // torch.cuda.device_count())
+        print('Turn on debugging mode')
+        model = SPMM(config=config, tokenizer=tokenizer, loader_len=len(all_dataset) // torch.cuda.device_count(), debugging=True)
+        et2 = time.time()
+    else: 
+        model = SPMM(config=config, tokenizer=tokenizer, loader_len=len(all_dataset) // torch.cuda.device_count(), debugging=False)
+#    else:
+#        from bk_SPMM_models import SPMM
+#        from bk_dataset import SMILESDataset_pretrain
+#        st = time.time()
+#        if (args.pkl is None):
+#            dataset = SMILESDataset_pretrain(args.data_path)
+#            with open('SMILESDataset.pkl', 'wb') as f:
+#                pickle.dump(dataset, f)
+#        else:
+#            dataset = pickle.load(open(args.pkl, 'rb'))
+#        et = time.time()
+#        print('time for dataset', et-st)
+#        print('#data:', len(dataset), torch.cuda.is_available())
+#        print('turn off debugging')
+#
+#        data_loader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=0, shuffle=False, pin_memory=True, drop_last=True)
+#        model = SPMM(config=config, tokenizer=tokenizer, loader_len=len(data_loader) // torch.cuda.device_count())
 
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location='cpu')
@@ -78,6 +93,7 @@ def main(args, config):
 #                         logger=True
                          )
     trainer.logger = csv_logger
+    print('start model.fit')
     trainer.fit(model, data_loader, None, ckpt_path=args.checkpoint if args.checkpoint else None)
 
 
@@ -97,7 +113,6 @@ if __name__ == '__main__':
     parser.add_argument('--strategy', type=str, default='auto')
 
     args = parser.parse_args()
-
 
     pretrain_config = {
         'property_width': 256,#768

@@ -1,4 +1,4 @@
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 import torch
 import random
 import pandas as pd
@@ -13,6 +13,7 @@ from torch.nn.utils.rnn import pad_sequence
 from multiprocessing import Pool
 from tqdm import tqdm
 import numpy as np
+import os
 RDLogger.DisableLog('rdApp.*')
 torch.multiprocessing.set_sharing_strategy('file_system')
 property_mean, property_std = pickle.load(open('./normalize.pkl', 'rb') )
@@ -24,6 +25,7 @@ class SMILESDataset_pretrain(Dataset):
         self.smiles = [l.strip() for l in open(data_path).readlines()]
 
         with Pool(24) as p:
+            #results (prop=np.ndarray, smiles=text, atom_pair=list, dist=list)
             results = list(tqdm(p.imap(data_preprocess, enumerate(self.smiles) ), total=len(self.smiles)) )
         self.data = [item for item in results if all(x is not None for x in item)]
 
@@ -31,7 +33,7 @@ class SMILESDataset_pretrain(Dataset):
             random.shuffle(self.data)
 
     def __len__(self):
-        smiles, properties = self.data[idx]
+        prop, smiles, atom_pair, dist = self.data[idx]
         return len(self.data)
 
     def __getitem__(self, index):
@@ -55,7 +57,6 @@ def data_preprocess(args):
         atom_set = to_numpy(atom_set)
         dist = to_numpy(dist)
         return properties, smiles, atom_set, dist
-#        return smiles, properties
 
     except Exception as e:
         print(f"Failed processing {idx}: {e}")
@@ -63,9 +64,10 @@ def data_preprocess(args):
             
 def collate_fn(batch):
     properties, smiles, atom_pair, dist = zip(*batch)
-#    print(type(properties[0]))
-    if isinstance(properties[0], list):#list
-        properties = torch.tensor(properties)
+    #print(type(properties[0]))
+    if isinstance(properties[0], np.ndarray):#np.array
+    #if isinstance(properties[0], list):#np.array
+        properties = torch.tensor(np.array(properties), dtype=torch.float32)
         atom_pair = pad_sequence([torch.tensor(a).long() for a in atom_pair], batch_first=True, padding_value=0)
         dist = pad_sequence([torch.tensor(d).float() for d in dist], batch_first=True, padding_value=0)
     else: #tensor

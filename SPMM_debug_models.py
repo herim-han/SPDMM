@@ -135,7 +135,7 @@ class SPMM(pl.LightningModule):
             self.set_eval_mode()
         with torch.no_grad():
             self.temp.clamp_(0.01, 0.5) #all elements in range (min, max)
-
+        #print('property_original device ', property_original.dtype)
         property_feature = self.prop_embed(property_original.clone().detach().unsqueeze(2))
         unk_tokens = self.prop_mask.expand(property_original.size(0), property_original.size(1), -1)
         prop_mpm_mask = torch.bernoulli(torch.ones_like(property_original) * 0.5) #(B, len)
@@ -217,7 +217,7 @@ class SPMM(pl.LightningModule):
             if any(torch.isnan(x).any() for x in [sim_score, loss]):
                 sim_score, loss = 0 , 0
             sim_dict[f'{key}2{key}'], loss_dict[f'{key}2{key}'] = sim_score, loss
-
+        
         all_loss  = sum(loss_dict.values() )
         loss_ita = all_loss * 0.5
         
@@ -301,10 +301,8 @@ class SPMM(pl.LightningModule):
         scheduler = self.lr_schedulers()
         optimizer.zero_grad()
         prop, text, atom_pair, dist = train_batch #tensor (B, 53), list (B), list (B)
-#        print('step for training', type(prop), type(text), type(atom_pair), type(dist))
-        print('device', prop.device, atom_pair.device, dist.device)
-        # self.tokenizer = BertTokenizer from transformers
-        # text_input contained two [CLS] token
+        #Check device !!!
+        #print('device', prop.device, atom_pair.device, dist.device)
         text_input = self.tokenizer(text, padding='longest', truncation=True, max_length=100, return_tensors="pt").to(prop.device)
 
         #warm up lr
